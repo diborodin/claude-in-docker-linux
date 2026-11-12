@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Bootstrap the adjacent source bundle, including installed symlink layouts."""
+
+import sys
+
+# Managed bundles must remain exactly the files recorded in their manifest.
+sys.dont_write_bytecode = True
+
+if sys.version_info < (3, 11):
+    sys.stderr.write("claude-docker requires Python 3.11 or newer; install Python 3.11+ and run again.\n")
+    raise SystemExit(1)
+
+import os
+from pathlib import Path
+
+# Keep selection here independent of package imports: an override may select a
+# bundle beside a standalone installed command that has no adjacent package.
+if "CLAUDE_DOCKER_DIR" in os.environ:
+    program_dir = Path(os.environ["CLAUDE_DOCKER_DIR"])
+    if not program_dir.is_absolute():
+        sys.stderr.write("claude-docker: CLAUDE_DOCKER_DIR must be an absolute program directory\n")
+        raise SystemExit(1)
+    location_label = "CLAUDE_DOCKER_DIR"
+else:
+    program_dir = Path(__file__).resolve().parent
+    location_label = "Program directory"
+
+if not (program_dir / "src/claude_docker/cli.py").is_file():
+    sys.stderr.write(f"claude-docker: {location_label} has no launcher package: {program_dir}\n")
+    raise SystemExit(1)
+
+sys.path.insert(0, str(program_dir.resolve() / "src"))
+
+from claude_docker.cli import main
+
+raise SystemExit(main())

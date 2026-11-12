@@ -1,0 +1,53 @@
+# Opt in with -f compose.yaml -f compose.sysbox.yaml on a Sysbox host.
+services:
+  inner-docker:
+    image: docker:29-dind
+    runtime: sysbox-runc
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+      DOCKER_TLS_SAN: DNS:inner-docker
+    volumes:
+      - inner-docker-data:/var/lib/docker
+      - inner-docker-ca:/certs/ca
+      - inner-docker-client:/certs/client
+    healthcheck:
+      test:
+        - CMD
+        - docker
+        - --host=tcp://localhost:2376
+        - --tlsverify
+        - --tlscacert=/certs/client/ca.pem
+        - --tlscert=/certs/client/cert.pem
+        - --tlskey=/certs/client/key.pem
+        - info
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    labels: &sysbox-managed-labels
+      io.github.diborodin.claude-in-docker-linux.managed: "true"
+      io.github.diborodin.claude-in-docker-linux.owner-uid: ${CLAUDE_HOST_UID}
+
+  claude-cli:
+    environment: &docker-client-environment
+      DOCKER_HOST: tcp://inner-docker:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+    volumes: &docker-client-volumes
+      - inner-docker-client:/certs/client:ro
+    depends_on: &docker-client-dependencies
+      inner-docker:
+        condition: service_healthy
+
+  claude-desktop:
+    environment: *docker-client-environment
+    volumes: *docker-client-volumes
+    depends_on: *docker-client-dependencies
+
+volumes:
+  inner-docker-data:
+    labels: *sysbox-managed-labels
+  inner-docker-ca:
+    labels: *sysbox-managed-labels
+  inner-docker-client:
+    labels: *sysbox-managed-labels

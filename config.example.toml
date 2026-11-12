@@ -1,0 +1,45 @@
+# Settings omitted here retain detected host-account and home defaults.
+# Process CLAUDE_* overrides take precedence over this file.
+# Paths are absolute or start with ~/ (the invoking host user's home).
+# UID/GID range: 1..4294967294. Account names: [a-z_][a-z0-9_-]*, max 32.
+# The root account and filesystem root as container home are not supported.
+# Boolean environment overrides accept true/1/yes/on or false/0/no/off,
+# case-insensitively, with surrounding spaces permitted. Empty scalars fail.
+docker_mode = "none" # "sysbox" explicitly enables isolated inner Docker.
+
+[container]
+# Uncomment to override detected identity:
+# Desktop requires uid to equal the invoking host UID for private X11 grants.
+# Differing uid overrides are supported for CLI commands only.
+# user = "developer"
+# uid = 1000
+# gid = 1000
+# home = "/home/developer"
+# Each distinct workspace is mounted at the SAME absolute path in the container.
+# Use the narrowest useful roots. An empty [] disables workspace mounts.
+mounts = ["~/work/git", "~/work/etc", "/srv/shared-projects"]
+
+[state.code]
+source = "~/.claude"
+mount = true # false disables this state mount and uses container-local state.
+
+[state.code_json]
+source = "~/.claude.json"
+mount = true # false disables; a missing host file is never created.
+
+[state.desktop]
+source = "~/.config/Claude"
+mount = true # false disables this mount.
+
+[desktop]
+sandbox = true # false explicitly requests Chromium --no-sandbox.
+clipboard = "manual" # "bidirectional" opts into background synchronization.
+seccomp = "default" # "chromium" explicitly enables the bundled namespace policy.
+
+[environment]
+# These lists contain exact variable NAMES only, never credential values.
+required = []
+optional = []
+# AWS example: replace the empty required list above with:
+# required = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+# optional = ["AWS_REGION", "AWS_DEFAULT_REGION"]

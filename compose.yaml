@@ -1,0 +1,33 @@
+# The launcher supplies identity values and a generated runtime mount override.
+services:
+  claude-cli:
+    build:
+      context: .
+      target: cli
+      args: &claude-build-args
+        CLAUDE_USER: ${CLAUDE_USER}
+        CLAUDE_UID: ${CLAUDE_UID}
+        CLAUDE_GID: ${CLAUDE_GID}
+        CLAUDE_HOME: ${CLAUDE_HOME}
+        CLAUDE_HOST_UID: ${CLAUDE_HOST_UID}
+    image: claude-docker-cli-${CLAUDE_HOST_UID}:latest
+    init: true
+    command: ["sleep", "infinity"]
+    labels: &managed-labels
+      io.github.diborodin.claude-in-docker-linux.managed: "true"
+      io.github.diborodin.claude-in-docker-linux.owner-uid: ${CLAUDE_HOST_UID}
+
+  claude-desktop:
+    profiles: [desktop]
+    build:
+      context: .
+      target: desktop
+      args: *claude-build-args
+    image: claude-docker-desktop-${CLAUDE_HOST_UID}:latest
+    init: true
+    command: ["sleep", "infinity"]
+    labels: *managed-labels
+
+networks:
+  default:
+    labels: *managed-labels
