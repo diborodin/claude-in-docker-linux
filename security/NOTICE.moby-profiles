@@ -1,0 +1,27 @@
+Desktop Chromium seccomp policy
+
+Derived from Moby profiles, Copyright The Moby Authors.
+Licensed under the Apache License, Version 2.0; see LICENSE.moby-profiles.
+Upstream tag: seccomp/v0.2.4 (github.com/moby/profiles).
+Policy source: https://raw.githubusercontent.com/moby/profiles/seccomp/v0.2.4/seccomp/default.json
+License source: https://raw.githubusercontent.com/moby/profiles/seccomp/v0.2.4/LICENSE
+Upstream NOTICE URL checked: https://raw.githubusercontent.com/moby/profiles/seccomp/v0.2.4/NOTICE
+No upstream NOTICE was supplied at this tag (HTTP 404).
+
+Original policy byte SHA256:
+785b2429264afba4d594320337cb17f144f3c7d51585f9805eef72e28f4f9334
+Original policy semantic SHA256 (sorted keys, compact separators, no newline):
+20ef2b6bfd980e7dd56a971d9ec0d71bc0f2d1184415f2d968a19bbcff9ee2b2
+Derived policy byte SHA256:
+f245d64a3213793f730f394d44c507145b13ffc8d05acb21b5146413aa395a74
+License byte SHA256:
+cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+
+Modifications: appended exactly four SCMP_ACT_ALLOW rules, in this order,
+each with one argument constraint at index 0 using SCMP_CMP_EQ:
+  clone   268435473
+  unshare 268435456
+  clone   1879048209
+  clone   536870929
+All other upstream policy keys and rules are preserved. JSON was serialized
+using json.dumps(profile, indent=2) followed by one newline.

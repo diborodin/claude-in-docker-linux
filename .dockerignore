@@ -1,0 +1,6 @@
+# Deny every path by default, including state, credentials, Git and workspaces.
+**
+!Dockerfile
+!image/mise.toml
+!image/mise.lock
+!image/customize.sh

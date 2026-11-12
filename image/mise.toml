@@ -1,0 +1,15 @@
+# Optional working tools shared by the CLI and Desktop images.
+# Declare apt additions here; keep image boot dependencies in Dockerfile.
+[bootstrap.packages]
+"apt:jq" = "latest"
+"apt:less" = "latest"
+"apt:bsdextrautils" = "latest"
+
+[tools]
+kubectl = "latest"
+
+# Refresh with the pinned mise container and exactly these two platforms:
+# mise lock --platform linux-x64,linux-arm64
+[settings]
+lockfile = true
+locked_require_checksum = true
