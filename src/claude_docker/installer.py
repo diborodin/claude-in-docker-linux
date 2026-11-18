@@ -23,32 +23,42 @@ from .paths import HostPaths, resolve_host_paths
 BUNDLE_FILES = (
     ".dockerignore", "claude-docker", "install", "VERSION", "README.md", "LICENSE",
     "Dockerfile", "compose.yaml", "compose.sysbox.yaml", "config.example.toml",
-    "image/customize.sh", "image/mise.lock", "image/mise.toml",
+    "image/claude-code.version", "image/customize.sh", "image/customize.example.sh", "image/mise.lock", "image/mise.toml",
     "src/claude_docker/__init__.py", "src/claude_docker/__main__.py",
-    "src/claude_docker/checks.py", "src/claude_docker/cli.py",
+    "src/claude_docker/checks.py", "src/claude_docker/claude_version.py", "src/claude_docker/cli.py",
     "src/claude_docker/clipboard.py", "src/claude_docker/commands.py",
-    "src/claude_docker/compose.py", "src/claude_docker/config.py",
+    "src/claude_docker/compose.py", "src/claude_docker/config.py", "src/claude_docker/customize.py",
     "src/claude_docker/desktop.py", "src/claude_docker/environment.py",
     "src/claude_docker/installer.py", "src/claude_docker/manifest.py",
     "src/claude_docker/model.py", "src/claude_docker/mounts.py",
     "src/claude_docker/paths.py", "src/claude_docker/process.py",
     "src/claude_docker/state.py", "src/claude_docker/uninstall.py",
     "src/claude_docker/seccomp.py",
+    "src/claude_docker/tool_config.py", "src/claude_docker/image_tools.py",
     "security/desktop-seccomp-v0.2.4-linux-amd64.json",
     "security/LICENSE.moby-profiles", "security/NOTICE.moby-profiles",
 )
 
 
 # These are exact historical inventories, not permission to omit individual
-# current inputs. Earlier releases had 34 files before the project license,
+# current inputs. Earlier releases had 39 files before Claude Code pinning,
+# 37 before user customization, 35 before user tool profiles, 34 before the license,
 # 30 before the policy assets, and 29 before uninstall.py.
-_PRE_LICENSE_FILES = frozenset(BUNDLE_FILES) - {"LICENSE"}
+_PRE_CODE_VERSION_FILES = frozenset(BUNDLE_FILES) - {
+    "image/claude-code.version", "src/claude_docker/claude_version.py",
+}
+_PRE_CUSTOMIZE_FILES = _PRE_CODE_VERSION_FILES - {"image/customize.example.sh", "src/claude_docker/customize.py"}
+_PRE_USER_TOOLS_FILES = _PRE_CUSTOMIZE_FILES - {
+    "src/claude_docker/tool_config.py", "src/claude_docker/image_tools.py",
+}
+_PRE_LICENSE_FILES = _PRE_USER_TOOLS_FILES - {"LICENSE"}
 _PRE_POLICY_FILES = _PRE_LICENSE_FILES - {
     "src/claude_docker/seccomp.py",
     "security/desktop-seccomp-v0.2.4-linux-amd64.json",
     "security/LICENSE.moby-profiles", "security/NOTICE.moby-profiles",
 }
-_RELEASE_INVENTORIES = (frozenset(BUNDLE_FILES), _PRE_LICENSE_FILES, _PRE_POLICY_FILES,
+_RELEASE_INVENTORIES = (frozenset(BUNDLE_FILES), _PRE_CODE_VERSION_FILES, _PRE_CUSTOMIZE_FILES,
+                        _PRE_USER_TOOLS_FILES, _PRE_LICENSE_FILES, _PRE_POLICY_FILES,
                         _PRE_POLICY_FILES - {"src/claude_docker/uninstall.py"})
 
 

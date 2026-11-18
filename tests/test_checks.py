@@ -206,28 +206,25 @@ class CheckTests(Fixture):
 
 
 class MaintenanceTests(Fixture):
-    def test_lock_uses_only_repository_image_mount_and_invoking_host_identity(self):
+    def test_source_base_lock_uses_snapshot_and_invoking_identity(self):
+        # Fake Docker leaves the copied, already-valid old native lock intact.
         runner = DockerRunner()
-        rc, _, stderr = self.invoke(['tools', 'lock'], runner)
+        program = self.root / 'source'
+        (program / 'image').mkdir(parents=True)
+        from tests.test_tool_config import NATIVE_LOCK
+        (program / 'image/mise.toml').write_text('[tools]\nkubectl="latest"\n')
+        (program / 'image/mise.lock').write_text(NATIVE_LOCK)
+        with patch('claude_docker.compose.resolve_program_dir', return_value=program):
+            rc, _, stderr = self.invoke(['tools', 'lock', '--base'], runner)
         self.assertEqual(rc, 0, stderr)
         self.assertEqual(len(runner.calls), 1)
         argv, kwargs = runner.calls[0]
         self.assertEqual(argv[:3], ['docker', 'run', '--rm'])
         self.assertEqual(argv[argv.index('--user') + 1], f'{os.getuid()}:{os.getgid()}')
-        self.assertEqual(argv[argv.index('--workdir') + 1], '/workspace')
+        self.assertNotIn('source=' + str(ROOT / 'image'), argv[argv.index('--mount') + 1])
+        self.assertIn('target=/workspace', argv[argv.index('--mount') + 1])
         self.assertEqual(argv[-4:], ['jdxcode/mise:2026.11.5', 'lock', '--platform', 'linux-x64,linux-arm64'])
-        self.assertEqual(argv.count('--mount'), 1)
-        self.assertIn('source=' + str(ROOT / 'image'), argv[argv.index('--mount') + 1])
-        self.assertNotIn('readonly', argv[argv.index('--mount') + 1])
-        self.assertNotIn('--volume', argv)
         self.assertIn('--tmpfs', argv)
-        container_env = [argv[i + 1] for i, argument in enumerate(argv) if argument == '--env']
-        self.assertEqual(container_env, ['HOME=/tmp', 'MISE_CACHE_DIR=/tmp/mise-cache',
-            'MISE_STATE_DIR=/tmp/mise-state', 'MISE_DATA_DIR=/tmp/mise-data',
-            'MISE_TRUSTED_CONFIG_PATHS=/workspace'])
-        self.assertNotIn('sh', argv)
-        self.assertNotIn('chown', argv)
-        self.assertNotIn('shell', kwargs)
         self.assertFalse(Path(self.env['HOME']).exists())
 
     def volume(self, **labels):

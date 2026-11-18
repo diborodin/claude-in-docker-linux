@@ -86,7 +86,7 @@ class ModeTransitionTests(ComposeFixture, unittest.TestCase):
                 self.project(config=replace(self.config, docker_mode=new)).up('claude-cli')
                 shutdown, start = [argv for argv, _ in self.runner.calls]
                 self.assertEqual(shutdown[-1], 'down')
-                self.assertEqual(start[-3:], ['up', '-d', 'claude-cli'])
+                self.assertEqual(start[-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
                 self.assertEqual(str(ROOT / 'compose.sysbox.yaml') in shutdown, old == 'sysbox')
                 self.assertEqual(str(ROOT / 'compose.sysbox.yaml') in start, new == 'sysbox')
                 self.assertEqual(state.read_mode(), new)
@@ -130,7 +130,7 @@ class ModeTransitionTests(ComposeFixture, unittest.TestCase):
         with patch('claude_docker.state.os.replace', side_effect=replace_file):
             with self.assertRaises(OSError):
                 project.up('claude-cli')
-        self.assertEqual(self.runner.calls[-1][0][-3:], ['up', '-d', 'claude-cli'])
+        self.assertEqual(self.runner.calls[-1][0][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
         self.assertIsNone(project.state.read_mode())
         self.assertEqual(project.state.read_pending(), 'sysbox')
         self.project().down()
@@ -199,7 +199,7 @@ class ModeTransitionTests(ComposeFixture, unittest.TestCase):
         self.project().up('claude-cli')
         self.assertIn(str(ROOT / 'compose.sysbox.yaml'), self.runner.calls[0][0])
         self.assertEqual(self.runner.calls[0][0][-1], 'down')
-        self.assertEqual(self.runner.calls[1][0][-3:], ['up', '-d', 'claude-cli'])
+        self.assertEqual(self.runner.calls[1][0][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
         self.assertFalse(pending.exists())
 
     def test_failed_generated_file_cleanup_retains_active_and_pending_for_retry(self):

@@ -20,6 +20,10 @@ from claude_docker.installer import InstallLayout, install_release
 from claude_docker.manifest import InstallManifest, InstallationRegistry
 
 
+CODE_VERSION_FILES = {'image/claude-code.version', 'src/claude_docker/claude_version.py'}
+CUSTOMIZE_FILES = {'src/claude_docker/customize.py', 'image/customize.example.sh'}
+
+
 class InstallFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -78,21 +82,21 @@ class InstallFixture(unittest.TestCase):
 
 
 class UpdateTests(InstallFixture):
-    def trim_release_inventory(self, removed):
-        metadata = self.layout.manifest_file('0.1.0')
+    def trim_release_inventory(self, removed, version='0.1.0'):
+        metadata = self.layout.manifest_file(version)
         data = json.loads(metadata.read_text())
         data['files'] = [entry for entry in data['files'] if entry['path'] not in removed]
         metadata.write_text(json.dumps(data))
         for name in removed:
-            (self.layout.release_dir('0.1.0') / name).unlink(missing_ok=True)
+            (self.layout.release_dir(version) / name).unlink(missing_ok=True)
         # Historical releases predate the whole security directory.
-        security = self.layout.release_dir('0.1.0') / 'security'
+        security = self.layout.release_dir(version) / 'security'
         if security.exists() and not any(security.iterdir()):
             security.rmdir()
         return data
 
     def test_historical_inventory_survives_new_policy_assets(self):
-        new = {'LICENSE', 'src/claude_docker/seccomp.py',
+        new = {'src/claude_docker/tool_config.py', 'src/claude_docker/image_tools.py', 'LICENSE', 'src/claude_docker/seccomp.py',
                'security/desktop-seccomp-v0.2.4-linux-amd64.json',
                'security/LICENSE.moby-profiles', 'security/NOTICE.moby-profiles'}
         for without_uninstall in (False, True):
@@ -100,7 +104,7 @@ class UpdateTests(InstallFixture):
                 self.layout = InstallLayout.user(dict(self.env, XDG_DATA_HOME=str(self.root / str(without_uninstall)),
                                                       HOME=str(self.root / ('home-' + str(without_uninstall)))))
                 self.install()
-                removed = new | ({'src/claude_docker/uninstall.py'} if without_uninstall else set())
+                removed = CODE_VERSION_FILES | CUSTOMIZE_FILES | new | ({'src/claude_docker/uninstall.py'} if without_uninstall else set())
                 data = self.trim_release_inventory(removed)
                 self.assertEqual(len(data['files']), 29 if without_uninstall else 30)
                 self.install('0.2.0')
@@ -109,15 +113,55 @@ class UpdateTests(InstallFixture):
 
     def test_historical_inventory_without_project_license_can_update(self):
         self.install()
-        data = self.trim_release_inventory({'LICENSE'})
+        data = self.trim_release_inventory(CODE_VERSION_FILES | CUSTOMIZE_FILES | {'LICENSE', 'src/claude_docker/tool_config.py',
+                                                             'src/claude_docker/image_tools.py'})
         self.assertEqual(len(data['files']), 34)
         self.install('0.2.0')
         self.assert_command_works('0.2.0')
         self.assertEqual((self.layout.release_dir('0.2.0') / 'LICENSE').read_bytes(),
                          (ROOT / 'LICENSE').read_bytes())
 
+    def test_historical_35_file_inventory_can_update(self):
+        self.install()
+        data = self.trim_release_inventory(CODE_VERSION_FILES | CUSTOMIZE_FILES | {'src/claude_docker/tool_config.py',
+                                                             'src/claude_docker/image_tools.py'})
+        self.assertEqual(len(data['files']), 35)
+        self.install('0.2.0')
+        self.assert_command_works('0.2.0')
+
+    def test_historical_37_file_inventory_can_upgrade_and_preserve_customize_hook(self):
+        self.install('0.3.0')
+        data = self.trim_release_inventory(CODE_VERSION_FILES | CUSTOMIZE_FILES, '0.3.0')
+        self.assertEqual(len(data['files']), 37)
+        hook = self.layout.host_paths.config_dir / 'customize.sh'
+        hook.parent.mkdir(parents=True)
+        hook.write_bytes(b'untouched user script')
+        before = self.snapshot(hook)
+        manifest = self.install('0.3.1')
+        self.assertEqual(len(manifest.files), 41)
+        self.assertEqual(self.snapshot(hook), before)
+        self.assert_command_works('0.3.1')
+
+    def test_historical_39_file_inventory_can_upgrade_and_preserve_user_version(self):
+        self.install('0.3.3')
+        data = self.trim_release_inventory(CODE_VERSION_FILES, '0.3.3')
+        self.assertEqual(len(data['files']), 39)
+        pin = self.layout.host_paths.config_dir / 'claude-code.version'
+        pin.parent.mkdir(parents=True)
+        pin.write_bytes(b'  2.2.99\n')
+        before = self.snapshot(pin)
+        manifest = self.install('0.3.4')
+        self.assertEqual(len(manifest.files), 41)
+        self.assertEqual(self.snapshot(pin), before)
+        shipped = self.layout.release_dir('0.3.4') / 'image/claude-code.version'
+        self.assertEqual(shipped.read_bytes(), b'latest\n')
+        self.assert_command_works('0.3.4')
+
     def test_incomplete_new_policy_inventory_is_rejected(self):
-        cases = [{'src/claude_docker/seccomp.py'},
+        cases = [{'image/claude-code.version'}, {'src/claude_docker/claude_version.py'},
+                 CODE_VERSION_FILES | {'src/claude_docker/customize.py'}, {'src/claude_docker/customize.py'}, {'image/customize.example.sh'},
+                 {'src/claude_docker/tool_config.py'}, {'src/claude_docker/image_tools.py'},
+                 {'src/claude_docker/seccomp.py'},
                  {'security/desktop-seccomp-v0.2.4-linux-amd64.json'},
                  {'security/LICENSE.moby-profiles'}, {'security/NOTICE.moby-profiles'},
                  {'src/claude_docker/uninstall.py'},
@@ -132,6 +176,22 @@ class UpdateTests(InstallFixture):
                 with self.assertRaisesRegex(ValueError, 'fixed runtime bundle'):
                     self.install('0.2.0')
                 self.assertEqual(self.snapshot(self.layout.root), before)
+
+    def test_02_to_03_update_preserves_default_and_custom_user_tool_files(self):
+        self.install('0.2.0')
+        files = (self.layout.host_paths.config_dir / 'mise.toml',
+                 self.layout.host_paths.config_dir / 'mise.lock',
+                 self.root / 'custom/tools.toml', self.root / 'custom/tools.lock')
+        for index, path in enumerate(files):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f'unchanged user input {index}\n'.encode())
+        before = {path: self.snapshot(path) for path in files}
+        with patch.dict(os.environ, dict(self.env, CLAUDE_MISE_CONFIG_FILE=str(files[2])), clear=True):
+            manifest = self.install('0.3.0')
+        self.assertEqual(len(manifest.files), 41)
+        for path in files:
+            self.assertEqual(self.snapshot(path), before[path])
+            self.assertNotIn(str(path), {str(item.path) for item in manifest.files})
 
     def test_update_preserves_command_link_and_all_user_files(self):
         self.install()
@@ -386,8 +446,9 @@ class AlternateModeTests(InstallFixture):
         self.assertEqual(actual.root, Path("/usr/local/share/claude-docker"))
         self.assertEqual(actual.command_link, Path("/usr/local/bin/claude-docker"))
         layout = InstallLayout.system(self.root / "prefix")
-        install_release(self.source, layout, version="0.2.0")
-        self.assertEqual(layout.command_link.resolve(), layout.release_dir("0.2.0") / "claude-docker")
+        version = (self.source / "VERSION").read_text().strip()
+        install_release(self.source, layout, version=version)
+        self.assertEqual(layout.command_link.resolve(), layout.release_dir(version) / "claude-docker")
         self.assertEqual(InstallationRegistry.read(layout.registry_file).mode, "system")
         self.assertFalse(self.layout.root.exists())
         self.assertEqual(list(self.home.iterdir()), [])

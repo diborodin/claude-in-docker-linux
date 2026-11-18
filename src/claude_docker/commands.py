@@ -4,6 +4,20 @@ from collections.abc import Mapping, Sequence
 import subprocess
 
 
+# Keep Docker client configuration usable while excluding arbitrary application
+# credentials and ambient Compose settings. Container credentials use docker exec.
+_DOCKER_ENVIRONMENT = (
+    'PATH', 'HOME', 'XDG_RUNTIME_DIR', 'DOCKER_HOST', 'DOCKER_CONTEXT',
+    'DOCKER_CONFIG', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_API_VERSION',
+    'SSH_AUTH_SOCK', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+)
+
+
+def docker_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """Keep Docker transport settings without ambient application credentials."""
+    return {key: env[key] for key in _DOCKER_ENVIRONMENT if key in env}
+
+
 class CommandRunner:
     def run(
         self,

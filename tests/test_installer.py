@@ -77,7 +77,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_version_file_agrees_with_package(self):
         self.assertEqual((ROOT / "VERSION").read_text().strip(), __version__)
-        self.assertEqual(__version__, "0.2.0")
+        self.assertEqual(__version__, "0.3.4")
 
     def test_install_copies_runtime_bundle_with_verified_manifest_and_links(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
@@ -114,7 +114,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_policy_bundle_is_complete_readable_and_importable(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
-        self.assertEqual(len(manifest.files), 35)
+        self.assertEqual(len(manifest.files), 41)
         installed = self.layout.release_dir(__version__)
         policy = installed / 'security/desktop-seccomp-v0.2.4-linux-amd64.json'
         self.assertEqual(hashlib.sha256(policy.read_bytes()).hexdigest(),
@@ -175,7 +175,7 @@ class InstallerTests(unittest.TestCase):
             'desktop-config/session', 'state/session', 'cache/token', 'workspaces/secret',
             'src/claude_docker/.aws/credentials', 'image/.claude/token',
             'src/claude_docker/secrets.txt', 'src/claude_docker/extra.py', 'image/secrets.txt',
-            'security/extra.json',
+            'security/extra.json', 'image/customize-user.sh',
         )
         for name in forbidden:
             target = source / name
@@ -191,13 +191,14 @@ class InstallerTests(unittest.TestCase):
         expected = {
             '.dockerignore', 'claude-docker', 'install', 'VERSION', 'README.md', 'LICENSE',
             'Dockerfile', 'compose.yaml', 'compose.sysbox.yaml', 'config.example.toml',
-            'image/customize.sh', 'image/mise.lock', 'image/mise.toml',
+            'image/customize.sh', 'image/customize.example.sh', 'image/mise.lock', 'image/mise.toml',
+            'image/claude-code.version',
             'security/desktop-seccomp-v0.2.4-linux-amd64.json',
             'security/LICENSE.moby-profiles', 'security/NOTICE.moby-profiles',
         } | {f'src/claude_docker/{module}.py' for module in (
-            '__init__', '__main__', 'checks', 'cli', 'clipboard', 'commands', 'compose',
-            'config', 'desktop', 'environment', 'installer', 'manifest', 'model',
-            'mounts', 'paths', 'process', 'seccomp', 'state', 'uninstall',
+            '__init__', '__main__', 'checks', 'claude_version', 'cli', 'clipboard', 'commands', 'compose',
+            'config', 'customize', 'desktop', 'environment', 'installer', 'manifest', 'model',
+            'mounts', 'paths', 'process', 'seccomp', 'state', 'uninstall', 'tool_config', 'image_tools',
         )}
         self.assertEqual(paths, expected)
         self.assertEqual({str(path.relative_to(release)) for path in release.rglob('*')

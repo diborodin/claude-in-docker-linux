@@ -168,7 +168,7 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
     def test_default_starts_only_desktop_then_detached_openbox_and_sandboxed_app(self):
         self.assertEqual(self.launch(app_args=('--help', 'literal; $(false)')), 0)
         ups = [argv for argv, _ in self.runner.calls if 'up' in argv]
-        self.assertEqual(ups[0][-3:], ['up', '-d', 'claude-desktop'])
+        self.assertEqual(ups[0][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-desktop'])
         detached = [argv for argv, _ in self.runner.calls if argv[:2] == ['docker', 'exec'] and '-d' in argv]
         self.assertEqual(len(detached), 2)
         self.assertEqual(detached[0][-1], 'openbox')

@@ -4,3 +4,7 @@
 !image/mise.toml
 !image/mise.lock
 !image/customize.sh
+!image/customize-user.sh
+!image/mise-user.toml
+!image/mise-user.lock
+!image/claude-code.version

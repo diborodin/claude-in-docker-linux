@@ -1,12 +1,27 @@
-# Optional working tools shared by the CLI and Desktop images.
+# Default working tools shared by the CLI and Desktop images.
 # Declare apt additions here; keep image boot dependencies in Dockerfile.
 [bootstrap.packages]
 "apt:jq" = "latest"
 "apt:less" = "latest"
 "apt:bsdextrautils" = "latest"
+"apt:ripgrep" = "latest"
+"apt:shellcheck" = "latest"
+"apt:shfmt" = "latest"
+"apt:sd" = "latest"
+"apt:miller" = "latest"
+"apt:hyperfine" = "latest"
+"apt:bats" = "latest"
 
 [tools]
-kubectl = "latest"
+fd = "latest"
+bat = "latest"
+ast-grep = "latest"
+yq = "latest"
+gh = "latest"
+uv = "latest"
+difftastic = "latest"
+"aqua:boyter/scc" = "latest"
+duckdb = "latest"
 
 # Refresh with the pinned mise container and exactly these two platforms:
 # mise lock --platform linux-x64,linux-arm64

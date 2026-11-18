@@ -118,28 +118,21 @@ class ContainerIntegrationTests(unittest.TestCase):
             with self.subTest(target=target):
                 image = self.build_image(target)
                 output = self.command(
-                    "docker", "run", "--rm", "--network", "none", image,
-                    "sh", "-ec", "\n".join([
-                        "id -u", "id -g", "command -v kubectl", "mise which kubectl",
-                        "kubectl version --client -o json", "mise --version", "claude --version",
-                    ]),
-                )
+                    'docker', 'run', '--rm', '--network', 'none', image, 'sh', '-ec',
+                    'id -u; id -g; ! command -v kubectl; jq --version; less --version | head -1; '
+                    'command -v column; mise --version; claude --version')
                 lines = output.splitlines()
-                self.assertEqual(lines[:3], ["10000", "10000", "/usr/local/share/mise/shims/kubectl"])
-                self.assertTrue(lines[3].startswith("/usr/local/share/mise/installs/kubectl/"), lines[3])
-                # kubectl JSON can span several lines; version commands follow it.
-                kubectl, end = json.JSONDecoder().raw_decode("\n".join(lines[4:]))
-                versions = "\n".join(lines[4:])[end:].strip().splitlines()
+                self.assertEqual(lines[:2], ['10000', '10000'])
+                self.assertRegex(lines[2], r'^jq-')
+                self.assertIn('less', lines[3])
+                self.assertEqual(lines[4], '/usr/bin/column')
+                versions = lines[5:]
                 self.assertEqual(len(versions), 2, output)
-                self.assertRegex(versions[0], r"\b\d+\.\d+\.\d+")
-                self.assertRegex(versions[1], r"\b\d+\.\d+\.\d+.*Claude Code")
-                buildx = self.command("docker", "run", "--rm", "--network", "none", image,
-                                      "docker", "buildx", "version")
-                self.assertRegex(buildx, r"github\.com/docker/buildx v\d+\.\d+\.\d+")
-                locked = tomllib.loads((ROOT / "image/mise.lock").read_text())
-                self.assertEqual(kubectl["clientVersion"]["gitVersion"],
-                                 "v" + locked["tools"]["kubectl"][0]["version"])
-                probes[target] = (lines[2], lines[3], kubectl["clientVersion"]["gitVersion"], versions[0])
+                self.assertRegex(versions[1], r'^\d+\.\d+\.\d+ \(Claude Code\)$')
+                buildx = self.command('docker', 'run', '--rm', '--network', 'none', image,
+                                      'docker', 'buildx', 'version')
+                self.assertRegex(buildx, r'github\.com/docker/buildx v\d+\.\d+\.\d+')
+                probes[target] = lines[2:6]
                 packages = self.command(
                     "docker", "run", "--rm", "--network", "none", image,
                     "dpkg-query", "-W", "-f=${binary:Package} ${db:Status-Status}\\n",
@@ -148,6 +141,15 @@ class ContainerIntegrationTests(unittest.TestCase):
                              if line.endswith(" installed")}
                 self.assertIn("docker-ce-cli", installed, "package probe returned no installed Docker client")
                 self.assertIn("docker-buildx-plugin", installed)
+                self.assertTrue({'ripgrep', 'jq', 'shellcheck', 'shfmt', 'sd', 'miller',
+                                 'hyperfine', 'bats', 'less', 'bsdextrautils'} <= installed)
+                for mounts in ((), ('--tmpfs', '/home/tester:rw,uid=10000,gid=10000')):
+                    self.command('docker', 'run', '--rm', '--network', 'none', *mounts, image,
+                                 'sh', '-ec', 'fd --version; bat --version; ast-grep --version; '
+                                 'yq --version; gh --version; uv --version; difft --version; '
+                                 'scc --version; duckdb --version; rg --version; '
+                                 'shellcheck --version; shfmt --version; sd --version; '
+                                 'mlr --version; hyperfine --version; bats --version')
                 gui = {name for name in installed if name in {"claude-desktop", "openbox", "libnss3"}
                        or name.startswith(("libgtk", "libx11", "fonts-"))}
                 if target == "cli":
@@ -155,18 +157,17 @@ class ContainerIntegrationTests(unittest.TestCase):
                 else:
                     self.assertTrue({"claude-desktop", "openbox"} <= gui, gui)
                 mounted = self.command(
-                    "docker", "run", "--rm", "--network", "none", "--tmpfs",
-                    "/home/tester:rw,uid=10000,gid=10000", image, "sh", "-ec",
-                    'command -v kubectl; mise which kubectl; kubectl version --client -o json; '
-                    'test ! -e "$HOME/.local/share/mise/installs"',
-                )
-                self.assertEqual(mounted.splitlines()[:2], list(probes[target][:2]))
-                self.assertEqual(json.loads("\n".join(mounted.splitlines()[2:])), kubectl)
+                    'docker', 'run', '--rm', '--network', 'none', '--tmpfs',
+                    '/home/tester:rw,uid=10000,gid=10000', image, 'sh', '-ec',
+                    '! command -v kubectl; jq --version; less --version | head -1; '
+                    'command -v column; mise --version; test ! -e "$HOME/.local/share/mise/installs"')
+                self.assertEqual(mounted.splitlines(), probes[target])
                 mounted_claude = self.command(
                     "docker", "run", "--rm", "--network", "none", "--tmpfs",
                     "/home/tester:rw,uid=10000,gid=10000", image, "sh", "-ec",
                     'command -v claude; test ! -L /usr/local/bin/claude; '
-                    'test ! -w /usr/local/bin/claude; claude --version; '
+                    'test ! -w /usr/local/bin/claude; test "$DISABLE_UPDATES" = 1; '
+                    'test "$(stat -c "%u:%g:%a" /usr/local/bin/claude)" = 0:0:555; claude --version; '
                     'mkdir -p "$HOME/.local/bin"; '
                     'printf "#!/bin/sh\\nexit 99\\n" > "$HOME/.local/bin/claude"; '
                     'chmod 0755 "$HOME/.local/bin/claude"; '
@@ -174,10 +175,51 @@ class ContainerIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(mounted_claude.splitlines(),
                                  ["/usr/local/bin/claude", versions[1]] * 2)
-                print(f"{target}: kubectl={probes[target][2]}, mise={versions[0]}, Code={versions[1]}",
+                print(f"{target}: baseline tools verified, mise={versions[0]}, Code={versions[1]}",
                       flush=True)
                 print(f"{target}: {buildx}; Code survives empty and shadowing home mounts", flush=True)
         self.assertEqual(probes["cli"], probes["desktop"])
+
+    def test_custom_cli_tools_survive_empty_home_and_stable_lock(self):
+        from claude_docker.image_tools import image_build_inputs, lock_image_tools
+        from claude_docker.paths import resolve_host_paths
+        with tempfile.TemporaryDirectory(prefix='claude-custom-smoke-') as temporary:
+            home = Path(temporary)
+            env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / 'config'))
+            env.pop('CLAUDE_MISE_CONFIG_FILE', None)
+            paths = resolve_host_paths(env, os.getuid(), create_runtime=False)
+            paths.config_dir.mkdir(parents=True)
+            source = paths.config_dir / 'mise.toml'
+            raw = b'[tools]\nkubectl="latest"\n[bootstrap.packages]\n"apt:tree"="latest"\n'
+            source.write_bytes(raw)
+            runner = CommandRunner()
+            lock_image_tools(ROOT, paths, runner, env)
+            locked = source.with_suffix('.lock').read_bytes()
+            lock_image_tools(ROOT, paths, runner, env)
+            self.assertEqual(source.with_suffix('.lock').read_bytes(), locked)
+            image = f'claude-docker-integration-{self.token}-custom:test'
+            self.images['custom'] = image
+            with image_build_inputs(ROOT, paths, env) as context:
+                args = ['docker', 'build', '--platform', self.build_platform, '--target', 'cli', '--tag', image]
+                for key, value in IDENTITY.items():
+                    args.extend(['--build-arg', f'{key}={value}'])
+                self.command(*args, str(context), timeout=7200)
+                self.command(*args, str(context), timeout=7200)
+            self.assertEqual(source.read_bytes(), raw)
+            self.assertEqual(source.with_suffix('.lock').read_bytes(), locked)
+            expected = tomllib.loads(locked.decode())['tools']['kubectl'][0]['version']
+            for mounts in ((), ('--tmpfs', '/home/tester:rw,uid=10000,gid=10000')):
+                output = self.command('docker', 'run', '--rm', '--network', 'none', *mounts, image,
+                    'sh', '-ec', 'id -u; id -g; command -v kubectl; mise which kubectl; '
+                    'kubectl version --client -o json; rg --version | head -1; jq --version; '
+                    'command -v column; tree --version | head -1; test ! -e "$HOME/.local/share/mise/installs"')
+                lines = output.splitlines()
+                self.assertEqual(lines[:3], ['10000', '10000', '/usr/local/share/mise/shims/kubectl'])
+                self.assertTrue(lines[3].startswith('/usr/local/share/mise/installs/kubectl/'))
+                version, _ = json.JSONDecoder().raw_decode('\n'.join(lines[4:]))
+                self.assertEqual(version['clientVersion']['gitVersion'], 'v' + expected)
+                self.assertIn('ripgrep ', output)
+                self.assertIn('tree v', output)
 
     def remove_cli_project(self, project_name):
         # Independent of launcher/Compose teardown; only our exact random project.

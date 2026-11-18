@@ -108,7 +108,7 @@ if 'ps' in args:
         result = self.invoke(('--help', '--model', 'model name', '--', '-p', 'literal; $(false)'))
         self.assertEqual(result.returncode, 37, result.stderr)
         commands = self.commands()
-        self.assertEqual(commands[0][-3:], ['up', '-d', 'claude-cli'])
+        self.assertEqual(commands[0][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
         self.assertEqual(commands[1][-3:], ['ps', '-q', 'claude-cli'])
         self.assertEqual(commands[2], ['exec', '-i', '--workdir', str(self.caller), '--env', 'TOKEN',
                                       '--env', 'EMPTY', 'container-one', 'claude', '--help', '--model',
@@ -130,7 +130,7 @@ if 'ps' in args:
         self.assertEqual(sum('down' in command for command in commands), 0)
         self.assertEqual(commands[-1], ['exec', '-i', '--workdir', str(self.caller), '--env', 'ROTATED',
                                        '--env', 'EMPTY', 'container-one', 'claude'])
-        self.assertEqual(sum(command[-3:] == ['up', '-d', 'claude-cli'] for command in commands), 2)
+        self.assertEqual(sum(command[-6:] == ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'] for command in commands), 2)
 
     def test_mode_transition_stops_old_mode_before_cli_only_start(self):
         self.assertEqual(self.invoke().returncode, 37)
@@ -140,7 +140,7 @@ if 'ps' in args:
         self.assertEqual(commands[3][-1], 'down')
         self.assertIn(str(ROOT / 'compose.yaml'), commands[3])
         self.assertNotIn(str(ROOT / 'compose.sysbox.yaml'), commands[3])
-        self.assertEqual(commands[4][-3:], ['up', '-d', 'claude-cli'])
+        self.assertEqual(commands[4][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
         self.assertIn(str(ROOT / 'compose.sysbox.yaml'), commands[4])
 
     def test_missing_or_empty_required_fails_before_any_docker_process(self):
@@ -194,7 +194,7 @@ if 'ps' in args:
                 self.assertNotIn('task5-unique-secret-sentinel', repr(calls))
                 self.assertNotIn('task5-unique-secret-sentinel', repr(diagnostics.call_args_list))
                 self.assertEqual(stdout.getvalue(), '')
-                self.assertEqual(stderr.getvalue(), '')
+                self.assertEqual(stderr.getvalue(), f'claude-docker: config: {self.config_file}\n')
 
     def test_compose_exception_diagnostic_does_not_expose_selected_values(self):
         stdout, stderr = io.StringIO(), io.StringIO()

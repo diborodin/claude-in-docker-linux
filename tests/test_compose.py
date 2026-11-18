@@ -56,6 +56,11 @@ class ComposeFixture:
         self.config.state_code_json.source.write_text('{}')
         self.runner = RecordingRunner()
 
+
+    def seed_code_version(self, config_dir):
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / 'claude-code.version').write_text('2.1.326\n')
+
     def project(self, **kwargs):
         config = kwargs.pop('config', self.config)
         return ComposeProject(config, self.paths, prepare_mounts(config), self.runner,
@@ -63,6 +68,76 @@ class ComposeFixture:
 
 
 class ComposeTests(ComposeFixture, unittest.TestCase):
+    def test_build_uses_private_literal_context_override_without_runtime_mutation(self):
+        project = self.project()
+        context = self.root / 'selected $TOKEN, space'
+        context.mkdir()
+        seen = []
+        original = self.runner.run
+        def run(argv, **kwargs):
+            override = Path(argv[argv.index('-f', argv.index('-f') + 1) + 1])
+            seen.append(override)
+            model = json.loads(override.read_text())
+            self.assertEqual(model['services']['claude-cli']['build']['context'], str(context).replace('$', '$$'))
+            self.assertEqual(model['services']['claude-cli']['build']['args']['CLAUDE_UID'], '1234')
+            self.assertEqual(override.stat().st_mode & 0o777, 0o600)
+            return original(argv, **kwargs)
+        self.runner.run = run
+        project.build('claude-cli', pull=True, no_cache=True, build_context=context)
+        self.assertFalse(seen[0].exists())
+        self.assertFalse(project.override_path.exists())
+        self.assertFalse(self.paths.runtime_dir.exists())
+        self.assertIn('--pull', self.runner.calls[-1][0])
+        self.assertIn('--no-cache', self.runner.calls[-1][0])
+
+    def test_all_builds_share_immutable_snapshot_and_clean_failure(self):
+        profile = self.home / '.config/claude-docker/mise.toml'
+        profile.parent.mkdir(parents=True)
+        profile.write_text('[bootstrap.packages]\n"apt:ripgrep"="latest"')
+        self.seed_code_version(profile.parent)
+        contexts = []
+        def run(argv, **kwargs):
+            override = Path(argv[argv.index('-f', argv.index('-f') + 1) + 1])
+            build = json.loads(override.read_text())['services'][argv[-1]]['build']
+            context = Path(build['context'])
+            contexts.append(context)
+            self.assertEqual((context / 'image/mise-user.toml').read_text(), '[bootstrap.packages]\n"apt:ripgrep"="latest"')
+            profile.write_text('[tools]\nkubectl="changed-without-lock"')
+            if len(contexts) == 2:
+                raise subprocess.CalledProcessError(7, argv)
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        self.runner.run = run
+        with patch.dict(os.environ, {'HOME': str(self.home)}, clear=True), \
+                patch('claude_docker.cli.CommandRunner', return_value=self.runner), redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['build', '--all']), 1)
+        self.assertEqual(len(contexts), 2)
+        self.assertEqual(contexts[0], contexts[1])
+        self.assertFalse(contexts[0].exists())
+
+    def test_missing_image_startup_has_build_guidance_and_no_pull(self):
+        self.runner.fail_operation = 'up'
+        stderr = io.StringIO()
+        with self.assertRaises(subprocess.CalledProcessError), redirect_stderr(stderr):
+            self.project().up('claude-cli')
+        self.assertIn('claude-docker build', stderr.getvalue())
+        argv = self.runner.calls[-1][0]
+        self.assertIn('--no-build', argv)
+        self.assertEqual(argv[argv.index('--pull') + 1], 'never')
+
+    def test_launch_stop_and_help_do_not_read_user_tool_profiles(self):
+        with patch('claude_docker.image_tools.read_user_tools', side_effect=AssertionError('profile read')):
+            project = self.project()
+            project.up('claude-cli')
+            project.down()
+            with self.assertRaises(SystemExit) as result, redirect_stdout(io.StringIO()):
+                cli.main(['build', '--help'])
+            self.assertEqual(result.exception.code, 0)
+
+    def test_start_disables_implicit_builds(self):
+        project = self.project()
+        project.up('claude-cli')
+        self.assertIn('--no-build', self.runner.calls[-1][0])
+
     def test_teardown_factory_ignores_launch_invalid_identity_and_rejects_launch_and_build(self):
         factory = getattr(ComposeProject, 'for_teardown', None)
         self.assertIsNotNone(factory)
@@ -151,6 +226,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
             self.assertEqual(service['environment']['HOME'], '/home/tester')
 
     def test_private_override_contains_no_forwarded_secret_values(self):
+        self.seed_code_version(self.paths.config_dir)
         with patch.dict(os.environ, {'SECRET': 'never-persist-this-value', 'UNRELATED': 'also-private'}):
             project = self.project()
             output = project.write_override()
@@ -211,6 +287,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         self.assertIn('--profile', self.runner.calls[-1][0])
 
     def test_operations_reuse_file_list_and_build_flags(self):
+        self.seed_code_version(self.paths.config_dir)
         project = self.project(config=replace(self.config, docker_mode='sysbox'))
         project.up('claude-cli')
         self.assertEqual(project.container_id('claude-cli'), 'container-one')
@@ -226,7 +303,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
                 index = without_profile.index('--profile')
                 del without_profile[index:index + 2]
             self.assertEqual(without_profile[:len(prefix)], prefix)
-        self.assertEqual(commands[0][-3:], ['up', '-d', 'claude-cli'])
+        self.assertEqual(commands[0][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
         self.assertEqual(commands[1][-3:], ['ps', '-q', 'claude-cli'])
         self.assertEqual(commands[2][-4:], ['build', '--pull', '--no-cache', 'claude-cli'])
         self.assertEqual(commands[3][-2:], ['pull', 'inner-docker'])
@@ -289,6 +366,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         self.assertEqual(self.runner.calls[-1][0][-1], 'down')
 
     def test_nonruntime_cli_commands_ignore_unavailable_sources_and_do_not_create_state(self):
+        self.seed_code_version(self.root / 'profile/claude-docker')
         runtime_base = self.root / 'run-base'
         runtime_base.mkdir(mode=0o700)
         config_file = self.root / 'settings.toml'
@@ -304,7 +382,8 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
                 with self.subTest(kind=kind, operation=operation):
                     self.runner.calls.clear()
                     env = {'HOME': str(self.home), 'CLAUDE_CONFIG_FILE': str(config_file),
-                           'XDG_RUNTIME_DIR': str(runtime_base)}
+                           'XDG_RUNTIME_DIR': str(runtime_base),
+                           'XDG_CONFIG_HOME': str(self.paths.config_dir.parent / 'profile')}
                     stderr = io.StringIO()
                     with patch.dict(os.environ, env, clear=True), \
                             patch('claude_docker.cli.CommandRunner', return_value=self.runner), \
@@ -316,10 +395,11 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
                     self.assertTrue(invalid_state.is_file())
                     for argv, _ in self.runner.calls:
                         files = [Path(argv[i + 1]).name for i, arg in enumerate(argv) if arg == '-f']
-                        self.assertEqual(files, ['compose.yaml'])
+                        self.assertEqual(files, ['compose.yaml', 'build.json'] if operation in ('build', 'rebuild') else ['compose.yaml'])
                         self.assertNotIn('--volumes', argv)
 
     def test_cli_build_rebuild_pull_and_stop_from_unrelated_directory(self):
+        self.seed_code_version(self.root / '.config/claude-docker')
         binary = self.root / 'bin'
         binary.mkdir()
         log = self.root / 'commands.jsonl'
@@ -351,6 +431,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         self.assertTrue(all(str(ROOT / 'compose.yaml') in cmd for cmd in commands))
 
     def test_cli_build_targets_require_explicit_desktop_or_all_selection(self):
+        self.seed_code_version(self.home / '.config/claude-docker')
         for operation in ('build', 'rebuild'):
             for options, expected in (([], ['claude-cli']),
                                       (['--desktop'], ['claude-desktop']),

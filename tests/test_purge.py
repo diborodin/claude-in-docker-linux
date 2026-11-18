@@ -245,6 +245,42 @@ class PurgeTests(unittest.TestCase):
         self.assertTrue(paths.config_dir.is_dir())
         self.assertTrue(paths.state_dir.is_dir())
 
+    def test_purge_retains_invalid_unreadable_or_looped_code_pin_without_reading_it(self):
+        for loop in (False, True):
+            with self.subTest(loop=loop):
+                if loop:
+                    install_release(ROOT, self.layout, version=__version__)
+                pin = self.layout.host_paths.config_dir / 'claude-code.version'
+                if loop:
+                    pin.unlink()
+                    pin.symlink_to(pin.name)
+                else:
+                    self.write(pin, 'invalid version')
+                    pin.chmod(0o000)
+                report = self.purge(yes=True)
+                self.assertIn(pin, report.retained)
+                if loop:
+                    self.assertEqual(pin.readlink(), Path(pin.name))
+                else:
+                    self.assertEqual(pin.stat().st_mode & 0o777, 0o000)
+
+    def test_purge_retains_unreadable_customize_script_without_opening_it(self):
+        hook = self.write(self.layout.host_paths.config_dir / 'customize.sh', 'invalid Bash (')
+        hook.chmod(0o000)
+        report = self.purge(yes=True)
+        self.assertIn(hook, report.retained)
+        self.assertEqual(hook.stat().st_mode & 0o777, 0o000)
+        hook.chmod(0o600)
+        self.assertEqual(hook.read_text(), 'invalid Bash (')
+
+    def test_purge_retains_customize_symlink_loop(self):
+        hook = self.layout.host_paths.config_dir / 'customize.sh'
+        hook.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        hook.symlink_to(hook.name)
+        report = self.purge(yes=True)
+        self.assertIn(hook, report.retained)
+        self.assertEqual(hook.readlink(), Path(hook.name))
+
     def test_protected_config_and_program_file_survive_without_recursive_parent_removal(self):
         target = self.layout.release_dir(__version__) / 'README.md'
         config = self.write(self.layout.host_paths.config_file,
@@ -291,6 +327,44 @@ class PurgeTests(unittest.TestCase):
                 self.assert_intact()
                 self.assertEqual(target.read_text(), value)
                 alias.unlink()
+
+    def test_user_tool_aliases_protect_launcher_and_owned_release_files_without_parsing(self):
+        # Missing tool retention would delete these real cleanup candidates.
+        paths = self.layout.host_paths
+        profile = paths.config_dir / 'mise.toml'
+        target = self.layout.release_dir(__version__) / 'README.md'
+        profile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        profile.symlink_to(target)
+        default_lock = self.write(profile.with_suffix('.lock'), 'stale invalid lock')
+        custom = self.home / 'selected.toml'
+        custom.symlink_to(paths.config_file)
+        config = self.write(paths.config_file, '')
+        custom_lock = self.home / 'selected.lock'
+        custom_lock.symlink_to(default_lock)
+        with patch.dict(os.environ, {'CLAUDE_MISE_CONFIG_FILE': str(custom)}):
+            report = self.purge(yes=True)
+        for path in (profile, target, default_lock, custom, config, custom_lock):
+            self.assertTrue(path.exists(), str(path))
+            self.assertIn(path, report.retained)
+        self.assertFalse(self.layout.command_link.is_symlink())
+
+    def test_control_characters_in_profile_selection_do_not_block_purge(self):
+        with patch.object(os, 'environ', dict(os.environ,
+                CLAUDE_MISE_CONFIG_FILE='/tmp/private\0selection.toml')):
+            self.purge(yes=True)
+        self.assertFalse(self.layout.command_link.is_symlink())
+
+    def test_missing_or_invalid_user_profile_does_not_block_purge(self):
+        paths = self.layout.host_paths
+        default = self.write(paths.config_dir / 'mise.toml', 'invalid TOML [')
+        lock = self.write(default.with_suffix('.lock'), 'stale lock')
+        missing = paths.cache_dir / 'absent.toml'
+        with patch.dict(os.environ, {'CLAUDE_MISE_CONFIG_FILE': str(missing)}):
+            report = self.purge(yes=True)
+        self.assertEqual(default.read_text(), 'invalid TOML [')
+        self.assertEqual(lock.read_text(), 'stale lock')
+        for path in (default, lock, missing, missing.with_suffix('.lock')):
+            self.assertIn(path, report.retained)
 
     def test_development_checkout_is_protected_inside_config_storage(self):
         self.purge(yes=True)

@@ -65,12 +65,12 @@ class InstallLifecycleTests(unittest.TestCase):
         (self.source / 'src/claude_docker/__init__.py').write_text('__version__ = "0.1.0"\n')
         self.docker_log = self.root / 'docker.jsonl'
 
-    def run_command(self, *arguments):
+    def run_command(self, *arguments, expected_stderr=''):
         result = subprocess.run([str(arg) for arg in arguments], cwd=self.root,
                                 env=self.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0,
                          f'{arguments!r}\nstdout: {result.stdout}\nstderr: {result.stderr}')
-        self.assertEqual(result.stderr, '')
+        self.assertEqual(result.stderr, expected_stderr)
         return result.stdout
 
     def snapshot(self, root):
@@ -138,6 +138,7 @@ class InstallLifecycleTests(unittest.TestCase):
             self.root / 'custom/code.json': 'custom code JSON',
             self.root / 'custom/desktop/preferences': 'custom desktop state',
             self.root / 'state/claude-docker/history': 'persistent launcher state',
+            self.root / 'config/claude-docker/customize.sh': 'invalid Bash (',
             self.root / 'cache/claude-docker/unknown': 'unknown cache payload',
             self.root / 'runtime/claude-docker/unknown': 'unknown runtime payload',
             self.program / 'user-owned/notes': 'unknown data payload',
@@ -173,6 +174,134 @@ class InstallLifecycleTests(unittest.TestCase):
         self.assert_cleanup_commands(self.program / 'releases/0.2.0')
         for path, snapshot in before.items():
             self.assertEqual(self.snapshot(path)['.'], snapshot, str(path))
+
+    def test_installed_user_tools_init_lock_all_build_leave_bundle_immutable(self):
+        # Fails if installed workflows rewrite shipped inputs or omit personal
+        # tool inputs from either product build. Only Docker is simulated.
+        example_lock = (ROOT / 'tests/fixtures/user-tools.lock').read_text()
+        (self.source / 'VERSION').write_text('0.3.0\n')
+        (self.source / 'src/claude_docker/__init__.py').write_text('__version__ = "0.3.0"\n')
+        self.run_command(self.source / 'install')
+        release = self.program / 'releases/0.3.0'
+        before = self.snapshot(release)
+        profile = self.root / 'config/claude-docker/mise.toml'
+        docker = self.bin_dir / 'docker'
+        docker.write_text(textwrap.dedent(f'''\
+            #!{sys.executable}
+            import csv, json, os, sys
+            from pathlib import Path
+            args = sys.argv[1:]
+            if args[0] == 'run':
+                assert args[-4:] == ['lock', '--platform', 'linux-x64,linux-arm64', '--bump'] or args[-3:] == ['lock', '--platform', 'linux-x64,linux-arm64'], args
+                fields = next(csv.reader([args[args.index('--mount') + 1]]))
+                root = Path(next(v[7:] for v in fields if v.startswith('source=')))
+                assert set(p.name for p in root.iterdir()) <= {{'mise.toml', 'mise.lock'}}
+                assert root != Path({str(profile.parent)!r})
+                (root / 'mise.lock').write_text({example_lock!r})
+            else:
+                assert args[0] == 'compose' and 'build' in args, args
+                files = [Path(args[i+1]) for i, v in enumerate(args) if v == '-f']
+                override = json.loads(files[-1].read_text())
+                build = override['services'][args[-1]]['build']
+                root = Path(build['context'])
+                assert (root / 'image/mise-user.lock').read_text() == {example_lock!r}
+                assert b'kubectl' in (root / 'image/mise-user.toml').read_bytes()
+                with Path({str(self.docker_log)!r}).open('a') as log:
+                    log.write(json.dumps({{'service': args[-1], 'context': str(root)}}) + '\\n')
+            '''))
+        docker.chmod(0o755)
+        self.run_command(self.command, 'tools', 'init', expected_stderr=f'claude-docker: tools: {profile}\n')
+        diagnostic = (f'claude-docker: config: {profile.parent / "config.toml"} '
+                      '(not found; using defaults and environment overrides)\n'
+                      f'claude-docker: tools: {profile}\n')
+        self.run_command(self.command, 'tools', 'lock', expected_stderr=diagnostic)
+        lock_before = profile.with_suffix('.lock').read_bytes()
+        self.run_command(self.command, 'tools', 'lock', expected_stderr=diagnostic)
+        self.assertEqual(profile.with_suffix('.lock').read_bytes(), lock_before)
+        self.write(profile.parent / 'claude-code.version', '2.1.326\n')
+        diagnostic = diagnostic.replace(f'claude-docker: tools: {profile}',
+                                        f'claude-docker: Claude Code version: 2.1.326\nclaude-docker: tools: {profile}')
+        self.run_command(self.command, 'build', '--all', expected_stderr=diagnostic)
+        builds = [json.loads(line) for line in self.docker_log.read_text().splitlines()]
+        self.assertEqual([build['service'] for build in builds], ['claude-cli', 'claude-desktop'])
+        self.assertEqual(builds[0]['context'], builds[1]['context'])
+        self.assertEqual(self.snapshot(release), before)
+        rejected = subprocess.run([str(self.command), 'tools', 'lock', '--base'],
+                                  env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('immutable', rejected.stderr)
+        self.assertEqual(self.snapshot(release), before)
+
+    def test_shared_bundle_selects_each_simulated_accounts_tools_and_image_identity(self):
+        # Simulates two accounts; this does not claim privileged multi-user
+        # qualification. A shared bundle must not select the installer's profile.
+        (self.source / 'VERSION').write_text('0.3.0\n')
+        (self.source / 'src/claude_docker/__init__.py').write_text('__version__ = "0.3.0"\n')
+        prefix = self.root / 'prefix'
+        self.run_command(sys.executable, '-c', SYSTEM_BOOTSTRAP,
+                         self.source / 'install', prefix, '--system')
+        release = prefix / 'share/claude-docker/releases/0.3.0'
+        before = self.snapshot(release)
+        docker = self.bin_dir / 'docker'
+        docker.write_text(textwrap.dedent(f'''\
+            #!{sys.executable}
+            import json, os, sys
+            from pathlib import Path
+            args = sys.argv[1:]
+            assert args[0] == 'compose' and args[-2:] == ['build', 'claude-cli'], args
+            files = [Path(args[i+1]) for i, value in enumerate(args) if value == '-f']
+            build = json.loads(files[-1].read_text())['services']['claude-cli']['build']
+            context = Path(build['context'])
+            data = (context / 'image/mise-user.toml').read_text()
+            assert not (context / 'image/mise-user.lock').exists()
+            with Path({str(self.docker_log)!r}).open('a') as log:
+                log.write(json.dumps({{'profile': data, 'host_uid': os.environ['CLAUDE_HOST_UID'],
+                                      'project': args[args.index('--project-name') + 1],
+                                      'build_identity': build['args']}}) + '\\n')
+            '''))
+        docker.chmod(0o755)
+        harness = '''
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+sys.dont_write_bytecode = True
+release, uid, home, *arguments = sys.argv[1:]
+sys.path.insert(0, str(Path(release) / 'src'))
+from claude_docker.cli import main
+account = SimpleNamespace(pw_name='user' + uid, pw_dir=home)
+with patch('os.getuid', return_value=int(uid)), patch('pwd.getpwuid', return_value=account):
+    raise SystemExit(main(arguments))
+'''
+        original_env = self.env
+        expected = []
+        for uid, package in ((12345, 'ripgrep'), (23456, 'htop')):
+            home = self.root / f'account-{uid}'
+            home.mkdir()
+            selected = self.root / f'xdg-{uid}/claude-docker/mise.toml'
+            profile = f'[bootstrap.packages]\n"apt:{package}" = "latest"\n'
+            self.write(selected, profile)
+            self.write(selected.parent / 'claude-code.version', '2.1.326\n')
+            self.env = dict(original_env, HOME=str(home), XDG_CONFIG_HOME=str(selected.parent.parent),
+                            CLAUDE_CONTAINER_USER=f'user{uid}', CLAUDE_CONTAINER_UID=str(uid),
+                            CLAUDE_CONTAINER_GID=str(uid), CLAUDE_CONTAINER_HOME=f'/home/user{uid}')
+            # Runtime paths remain isolated too, although build must not create them.
+            self.env.pop('XDG_RUNTIME_DIR')
+            diagnostic = (f'claude-docker: config: {selected.parent / "config.toml"} '
+                          '(not found; using defaults and environment overrides)\n'
+                          'claude-docker: Claude Code version: 2.1.326\n'
+                          f'claude-docker: tools: {selected}\n')
+            self.run_command(sys.executable, '-c', harness, release, uid, home, 'build',
+                             expected_stderr=diagnostic)
+            expected.append((str(uid), profile))
+        self.env = original_env
+        records = [json.loads(line) for line in self.docker_log.read_text().splitlines()]
+        self.assertEqual([(r['host_uid'], r['profile']) for r in records], expected)
+        for record, (uid, _) in zip(records, expected):
+            self.assertEqual(record['project'], 'claude-docker-' + uid)
+            self.assertEqual(record['build_identity']['CLAUDE_HOST_UID'], uid)
+            self.assertEqual(record['build_identity']['CLAUDE_UID'], uid)
+        self.assertEqual(self.snapshot(release), before)
 
     def test_development_bootstrap_observes_edits_and_uninstall_preserves_checkout(self):
         # Breaks if --dev copies a release, suppresses live edits, generates

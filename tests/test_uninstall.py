@@ -106,6 +106,20 @@ class UninstallTests(unittest.TestCase):
         self.assertTrue(executable.exists())
         self.assertEqual(self.calls, [])
 
+    def test_user_tool_paths_are_retained_without_reading_invalid_or_missing_profiles(self):
+        self.install()
+        paths = self.layout.host_paths
+        default = self.write(paths.config_dir / 'mise.toml', 'invalid TOML [')
+        lock = self.write(default.with_suffix('.lock'), 'stale lock')
+        custom = self.write(paths.cache_dir / 'optional.toml', 'also invalid [')
+        custom_lock = self.write(custom.with_suffix('.lock'), 'stale custom lock')
+        with patch.dict(os.environ, {'CLAUDE_MISE_CONFIG_FILE': str(custom)}):
+            report = self.api().uninstall_user(self.layout)
+        for path in (default, lock, custom, custom_lock):
+            self.assertTrue(path.exists())
+            self.assertIn(path, report.retained)
+        self.assertFalse(self.layout.command_link.is_symlink())
+
     def test_dev_uninstall_with_missing_policy_bypasses_launch_preflight(self):
         api = self.api()
         source = self.root / 'checkout'

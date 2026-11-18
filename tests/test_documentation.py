@@ -31,7 +31,14 @@ class DocumentationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = README.read_text(encoding='utf-8')
-        cls.sections = dict(re.findall(r'^## ([^\n]+)\n(.*?)(?=^## |\Z)', cls.text, re.M | re.S))
+        # Example Markdown headings belong to the copied file, not the manual.
+        cls.prose = re.sub(r'^```[^\n]*\n.*?^```[ \t]*$',
+                           lambda match: re.sub(r'[^\n]', ' ', match.group()),
+                           cls.text, flags=re.M | re.S)
+        headings = list(re.finditer(r'^## ([^\n]+)$', cls.prose, re.M))
+        cls.sections = {match.group(1): cls.text[match.end():
+                        headings[index + 1].start() if index + 1 < len(headings) else len(cls.text)]
+                        for index, match in enumerate(headings)}
         cls.shell = '\n'.join(re.findall(r'^[ \t]*```(?:bash|sh)\n(.*?)^[ \t]*```', cls.text, re.M | re.S))
 
     def section(self, heading):
@@ -48,10 +55,12 @@ class DocumentationTests(unittest.TestCase):
         # can ship checkout state. This release inventory is deliberately fixed.
         modules = {'__init__', '__main__', 'checks', 'cli', 'clipboard', 'commands',
                    'compose', 'config', 'desktop', 'environment', 'installer', 'manifest',
-                   'model', 'mounts', 'paths', 'process', 'seccomp', 'state', 'uninstall'}
+                   'model', 'mounts', 'paths', 'process', 'seccomp', 'state', 'uninstall', 'tool_config', 'image_tools',
+                   'customize', 'claude_version'}
         expected = {'.dockerignore', 'claude-docker', 'install', 'VERSION', 'README.md', 'LICENSE',
                     'Dockerfile', 'compose.yaml', 'compose.sysbox.yaml', 'config.example.toml',
-                    'image/customize.sh', 'image/mise.lock', 'image/mise.toml',
+                    'image/customize.sh', 'image/customize.example.sh', 'image/mise.lock', 'image/mise.toml',
+                    'image/claude-code.version',
                     'security/desktop-seccomp-v0.2.4-linux-amd64.json',
                     'security/LICENSE.moby-profiles', 'security/NOTICE.moby-profiles'}
         expected |= {f'src/claude_docker/{module}.py' for module in modules}
@@ -75,7 +84,7 @@ class DocumentationTests(unittest.TestCase):
     def test_version_matches_package_and_executable_from_unrelated_directory(self):
         version = (ROOT / 'VERSION').read_text().strip()
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$')
-        self.assertEqual(version, '0.2.0')
+        self.assertEqual(version, '0.3.4')
         self.assertEqual(__version__, version)
         with tempfile.TemporaryDirectory() as directory:
             env = {'HOME': directory, 'PATH': '', 'PYTHONDONTWRITEBYTECODE': '1'}
@@ -155,14 +164,17 @@ class DocumentationTests(unittest.TestCase):
                 self.assertTrue(any(words[:len(command)] == command for words in documented), command)
 
     def test_navigation_and_size(self):
-        self.assertEqual(HEADINGS, re.findall(r'^## (.+)$', self.text, re.M))
-        self.assertEqual(1, len(re.findall(r'^# [^#]', self.text, re.M)))
-        self.assertLessEqual(len(self.text.splitlines()), 540)
+        self.assertEqual(HEADINGS, re.findall(r'^## (.+)$', self.prose, re.M))
+        self.assertEqual(1, len(re.findall(r'^# [^#]', self.prose, re.M)))
+        # Allow the image update workflow in the compact manual.
+        self.assertLessEqual(len(self.text.splitlines()), 685)
         self.assertRegex(self.text, r'\]\((?:\./)?config\.example\.toml\)')
 
     def test_ordinary_install_and_cli_procedures_precede_optional_features(self):
-        self.contains_all(self.section('Install'), ['./install', '$HOME/.local/bin', 'claude-docker config init'])
-        self.contains_all(self.section('Start Claude'), ['claude-docker build', 'claude-docker claude', 'claude-docker stop'])
+        self.contains_all(self.section('Install'), ['./install', '$HOME/.local/bin', 'claude-docker config init',
+                                                    'claude-docker tools init', 'claude-docker tools lock',
+                                                    'claude-docker customize init', 'claude-docker build'])
+        self.contains_all(self.section('Start Claude'), ['claude-docker claude', 'claude-docker stop'])
         ordinary = self.section('Install') + self.section('Start Claude')
         self.assertNotRegex(ordinary, r'claude-docker (?:desktop|clipboard)|docker_mode\s*=\s*"sysbox"')
 
@@ -278,6 +290,31 @@ class DocumentationTests(unittest.TestCase):
                                    './claude-docker tools lock', 'trusted source', 'immutable'])
         self.assertRegex(update, r'(?i)contributor')
 
+    def test_installed_user_tool_workflow_and_sample_are_complete(self):
+        update = self.section('Update or uninstall')
+        self.contains_all(update, ['claude-docker tools init', 'claude-docker tools lock --bump',
+                                  '~/.config/claude-docker/mise.toml', 'CLAUDE_MISE_CONFIG_FILE',
+                                  'XDG_CONFIG_HOME', 'CLAUDE_CONFIG_FILE', 'mise.lock',
+                                  'custom.toml', 'custom.lock', 'kubectl', 'apt:tree',
+                                  'linux-x64', 'linux-arm64', 'dependency sidecars'])
+        self.assertRegex(update, r'(?is)profile and lock.*(?:updates).*uninstall.*purge')
+        self.assertRegex(update, r'(?is)apt-only.*no artifact lock')
+        self.assertRegex(update, r'(?is)manual.*migrat')
+        self.assertNotIn('Separate the base image tools from user tools', self.section('TODO'))
+        from claude_docker.tool_config import read_user_tools
+        samples = re.findall(r'^[ \t]*```toml\n(.*?)^[ \t]*```', update, re.M | re.S)
+        self.assertEqual(len(samples), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = config.HostPaths(*(Path(directory) / name for name in
+                                      ('home', 'config', 'data', 'state', 'cache', 'runtime')))
+            profile = paths.config_dir / 'mise.toml'
+            profile.parent.mkdir(parents=True)
+            profile.write_text(samples[0])
+            loaded = read_user_tools(paths, {}, require_lock=False)
+            self.assertEqual(loaded.tools, {'kubectl': '1.36',
+                                             'aws-cli': '2'})
+            self.assertEqual(loaded.packages, {'apt:tree': 'latest'})
+
     def test_removal_retention_consent_and_recovery(self):
         removal = self.section('Update or uninstall')
         self.contains_all(removal, ['claude-docker uninstall', 'claude-docker uninstall --purge --yes',
@@ -296,12 +333,14 @@ class DocumentationTests(unittest.TestCase):
         self.assertNotRegex(self.text, r'start\.sh|tools\.sh')
         self.assertNotIn('claude-docker-session.md', self.text)
 
-    def test_build_context_admits_only_four_image_inputs(self):
+    def test_build_context_admits_only_exact_image_inputs(self):
         patterns = [line.strip() for line in (ROOT / '.dockerignore').read_text().splitlines()
                     if line.strip() and not line.lstrip().startswith('#')]
         self.assertEqual(patterns[0], '**')
         self.assertCountEqual(patterns[1:], ['!Dockerfile', '!image/mise.toml',
-                                             '!image/mise.lock', '!image/customize.sh'])
+                                             '!image/mise.lock', '!image/customize.sh',
+                                             '!image/mise-user.toml', '!image/mise-user.lock',
+                                             '!image/customize-user.sh', '!image/claude-code.version'])
 
     def test_repository_file_references_exist(self):
         references = set(re.findall(r'\]\(([^)]+)\)', self.text))

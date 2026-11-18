@@ -1,8 +1,6 @@
 """Read-only host diagnostics and explicitly requested Docker maintenance."""
 
-import csv
 from dataclasses import dataclass
-import io
 import json
 import os
 import platform
@@ -165,27 +163,11 @@ def run_checks(config: AppConfig, *, smoke: bool, runner: CommandRunner,
     return results
 
 
-def lock_tools(project: ComposeProject) -> None:
-    """Run the image's mise entrypoint as the invoking user, with one writable bind."""
-    program = project.program_dir.resolve()
-    if (program / 'manifest.json').exists() or (program / 'manifest.json').is_symlink():
-        raise ValueError('tools lock requires a source/development checkout; installed bundles are immutable. '
-                         'Obtain a trusted source checkout and run ./claude-docker tools lock there.')
-    image_dir = project.program_dir / 'image'
-    if not image_dir.is_dir():
-        raise ValueError(f'Tool image directory does not exist: {image_dir}')
-    # Docker parses --mount using CSV; encode paths containing commas literally.
-    mount = io.StringIO()
-    csv.writer(mount, lineterminator='').writerow([
-        'type=bind', 'source=' + str(image_dir), 'target=/workspace'])
-    project.runner.run([
-        'docker', 'run', '--rm', '--user', f'{os.getuid()}:{os.getgid()}',
-        '--mount', mount.getvalue(), '--workdir', '/workspace',
-        '--tmpfs', '/tmp:rw,mode=1777', '--env', 'HOME=/tmp',
-        '--env', 'MISE_CACHE_DIR=/tmp/mise-cache', '--env', 'MISE_STATE_DIR=/tmp/mise-state',
-        '--env', 'MISE_DATA_DIR=/tmp/mise-data', '--env', 'MISE_TRUSTED_CONFIG_PATHS=/workspace',
-        'jdxcode/mise:2026.11.5', 'lock', '--platform', 'linux-x64,linux-arm64',
-    ], env=project.environment)
+def lock_tools(project: ComposeProject, *, base: bool = False, bump: bool = False) -> None:
+    """Resolve the invoking user's profile, or explicitly the contributor base."""
+    from .image_tools import lock_image_tools
+    lock_image_tools(project.program_dir, project.paths, project.runner, os.environ,
+                     base=base, bump=bump)
 
 
 def cleanup_inner_docker(project: ComposeProject, *, yes: bool) -> None:

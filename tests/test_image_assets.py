@@ -106,18 +106,15 @@ class ImageAssetTests(unittest.TestCase):
         config = tomllib.loads(config_path.read_text())
         self.assertEqual(config["bootstrap"]["packages"]["apt:jq"], "latest")
         self.assertEqual(config["bootstrap"]["packages"]["apt:less"], "latest")
-        self.assertIn("kubectl", config["tools"])
+        self.assertIn('apt:bsdextrautils', config['bootstrap']['packages'])
+        self.assertNotIn('kubectl', config.get('tools', {}))
         lock = tomllib.loads(lock_path.read_text())
-        self.assertIn("kubectl", lock["tools"])
-        self.assertTrue(lock["tools"]["kubectl"], "kubectl has no locked versions")
-        for entry in lock["tools"]["kubectl"]:
-            self.assertTrue(entry["version"])
-            platforms = {key.removeprefix("platforms."): value for key, value in entry.items()
-                         if key.startswith("platforms.")}
-            self.assertEqual(set(platforms), {"linux-x64", "linux-arm64"})
-            for data in platforms.values():
-                self.assertTrue(data["url"].startswith("https://"))
-                self.assertRegex(data["checksum"], r"^sha256:[a-f0-9]{64}$")
+        self.assertEqual(set(config['tools']), {
+            'fd', 'bat', 'ast-grep', 'yq', 'gh', 'uv', 'difftastic', 'aqua:boyter/scc', 'duckdb'})
+        self.assertEqual(set(config['bootstrap']['packages']), {
+            'apt:' + name for name in ('ripgrep', 'jq', 'shellcheck', 'shfmt', 'sd',
+                                      'miller', 'hyperfine', 'bats', 'less', 'bsdextrautils')})
+        self.assertEqual(set(lock.get('tools', {})), set(config['tools']))
 
     def test_every_declared_tool_has_matching_verified_platform_downloads(self):
         # A new declared tool or architecture URL must not silently escape locking.
@@ -125,9 +122,9 @@ class ImageAssetTests(unittest.TestCase):
         lock = tomllib.loads((ROOT / 'image/mise.lock').read_text())
         self.assertTrue(config['settings']['lockfile'])
         self.assertTrue(config['settings']['locked_require_checksum'])
-        self.assertEqual(set(lock['tools']), set(config['tools']))
+        self.assertEqual(set(lock.get('tools', {})), set(config['tools']))
         architectures = {'linux-x64': 'amd64', 'linux-arm64': 'arm64'}
-        for tool, entries in lock['tools'].items():
+        for tool, entries in lock.get('tools', {}).items():
             self.assertTrue(entries, tool)
             for entry in entries:
                 with self.subTest(tool=tool, version=entry['version']):
@@ -154,24 +151,48 @@ class ImageAssetTests(unittest.TestCase):
 
     def test_claude_system_binary_survives_home_mount(self):
         # A home-local symlink or earlier home PATH entry hides/replaces image Code.
-        common = self.stages()["common"]["instructions"]
-        user = "root"
-        installer_index = promotion_index = None
-        for index, (op, value) in enumerate(common):
-            if op == "USER":
-                user = value
-            elif op == "RUN" and "bash /tmp/claude-install.sh" in value:
-                self.assertEqual(user, "${CLAUDE_USER}")
-                self.assertIn("https://claude.ai/install.sh", value)
-                installer_index = index
-            elif op == "RUN" and "/usr/local/bin/claude" in value:
-                self.assertEqual(user, "root")
-                self.assertIn('readlink -f "${CLAUDE_HOME}/.local/bin/claude"', value)
-                self.assertRegex(value, r"install -m 0?555\b")
-                promotion_index = index
-        self.assertIsNotNone(installer_index, "official unprivileged installer is missing")
-        self.assertIsNotNone(promotion_index, "resolved native Code is not promoted outside home")
-        self.assertLess(installer_index, promotion_index)
+        stages = self.stages()
+        common = stages["common"]["instructions"]
+        stage = stages.get("claude-code")
+        self.assertIsNotNone(stage, "independent Code stage is missing")
+        self.assertEqual(stage["image"], "ubuntu:24.04")
+        instructions = stage["instructions"]
+        pin = next(index for index, (op, value) in enumerate(instructions)
+                   if op == "COPY" and value.startswith("image/claude-code.version "))
+        prerequisites = [(index, value) for index, (op, value) in enumerate(instructions)
+                         if op == "RUN" and "apt-get install" in value]
+        self.assertEqual(len(prerequisites), 1)
+        self.assertLess(prerequisites[0][0], pin)
+        fetch = " ".join(value for op, value in instructions[pin + 1:] if op == "RUN")
+        for token in ("downloads.claude.ai/claude-code-releases", "/manifest.json",
+                      "$platform/claude", "linux-x64", "linux-arm64", "sha256sum", "0555",
+                      ".platforms[$platform].checksum"):
+            with self.subTest(token=token):
+                self.assertIn(token, fetch)
+        self.assertEqual((ROOT / 'image/claude-code.version').read_bytes(), b'latest\n')
+        self.assertIn('if [ "$version" = latest ]', fetch)
+        self.assertIn('"$releases/latest"', fetch)
+        self.assertIn('version="$(read_version "$numeric")"', fetch)
+        self.assertIn("--proto '=https' --proto-redir '=https'", fetch)
+        self.assertNotRegex(fetch, r"install\.sh|npm")
+        for name in ("common", "desktop-runtime", "cli", "desktop"):
+            instructions = stages[name]["instructions"]
+            source = " ".join(value for _, value in instructions)
+            self.assertNotRegex(source, r"claude-code\.version|claude\.ai/install\.sh")
+            if name not in ("cli", "desktop"):
+                self.assertNotIn("DISABLE_UPDATES", source)
+                self.assertNotIn("/usr/local/bin/claude ", source)
+                continue
+            copies = [(i, shlex.split(value)) for i, (op, value) in enumerate(instructions)
+                      if op == "COPY" and "/usr/local/bin/claude" in value]
+            self.assertEqual(len(copies), 1)
+            index, fields = copies[0]
+            self.assertEqual(fields, ["--from=claude-code", "--chmod=0555",
+                                      "/out/claude", "/usr/local/bin/claude"])
+            self.assertLess(max(i for i, (op, _) in enumerate(instructions) if op == "RUN"), index)
+            env_index = instructions.index(("ENV", "DISABLE_UPDATES=1"))
+            self.assertGreater(env_index, max(i for i, (op, _) in enumerate(instructions) if op == "RUN"))
+            self.assertEqual([value for op, value in instructions if op == "USER"][-1], "${CLAUDE_USER}")
         environment = dict(field.split("=", 1) for op, value in common if op == "ENV"
                            for field in shlex.split(value))
         paths = environment["PATH"].split(":")
@@ -192,7 +213,7 @@ class ImageAssetTests(unittest.TestCase):
                         "CLI shared tools are missing")
 
     def test_desktop_is_a_gui_superset(self):
-        # Desktop must inherit Code/common, install GUI before tools, and retain ownership.
+        # Desktop must inherit common, install GUI before tools, and retain ownership.
         stages = self.stages()
         self.assertIn("desktop-runtime", stages)
         self.assertIn("desktop", stages)
@@ -219,6 +240,16 @@ class ImageAssetTests(unittest.TestCase):
         tool_ops = lambda name: [(op, value) for op, value in stages[name]["instructions"]
                                 if op in ("COPY", "RUN")]
         self.assertEqual(tool_ops("cli"), tool_ops("desktop"))
+
+    def test_baseline_neutral_user_input_is_valid_toml(self):
+        run = next(value for op, value in self.stages()['cli']['instructions']
+                   if op == 'RUN' and '/opt/user-tools' in value)
+        setup = run.split('if [ -f /opt/user-tools/mise-user.lock ]', 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(['sh', '-ec', setup.replace('/opt/user-tools', temporary)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(tomllib.loads((Path(temporary) / 'config.toml').read_text()), {'tools': {}})
 
     def test_customize_hook_is_safe_default(self):
         # The default root hook must perform no install or filesystem mutation.
@@ -248,12 +279,20 @@ class ImageAssetTests(unittest.TestCase):
             copies = [shlex.split(value) for op, value in stage["instructions"] if op == "COPY"]
             self.assertIn(["image/mise.toml", "/etc/mise/config.toml"], copies)
             self.assertIn(["image/mise.lock", "/etc/mise/mise.lock"], copies)
-            self.assertIn(["image/customize.sh", "/usr/local/lib/claude-image/customize.sh"], copies)
+            self.assertIn(['image/customize.sh', 'image/customize-user.*', '/usr/local/lib/claude-image/'], copies)
             runs = " ".join(value for op, value in stage["instructions"] if op == "RUN")
+            self.assertIn(['image/mise.toml', 'image/mise-user.*', '/opt/user-tools/'], copies)
+            self.assertIn('MISE_CONFIG_DIR=/opt/user-tools', (ROOT / 'Dockerfile').read_text())
+            self.assertIn('MISE_LOCKED=1', (ROOT / 'Dockerfile').read_text())
+            self.assertIn('chmod -R a+rX /opt/user-tools /etc/mise', runs)
             self.assertIn("mise bootstrap packages apply", runs)
             self.assertRegex(runs, r"mise install (?=[^&]*--locked)(?=[^&]*--system)")
             self.assertIn("mise reshim --system", runs)
             self.assertLess(runs.index("mise reshim --system"), runs.index("/usr/local/lib/claude-image/customize.sh"))
+            user_hook = 'bash -euo pipefail /usr/local/lib/claude-image/customize-user.sh'
+            self.assertLess(runs.index('/usr/local/lib/claude-image/customize.sh'), runs.index(user_hook))
+            user = next(value for op, value in stage['instructions'] if op == 'USER')
+            self.assertEqual(user, 'root')
             self.assertNotIn("--global", runs)
         env = " ".join(value for op, value in self.stages()["common"]["instructions"] if op == "ENV")
         self.assertIn("/usr/local/share/mise/shims", env)
@@ -266,8 +305,10 @@ class ImageAssetTests(unittest.TestCase):
                     if line.strip() and not line.lstrip().startswith("#")]
         self.assertEqual(patterns[0], "**")
         allowed = {pattern[1:] for pattern in patterns[1:] if pattern.startswith("!")}
-        self.assertEqual(allowed, {"Dockerfile", "image/mise.toml", "image/mise.lock", "image/customize.sh"})
-        self.assertEqual(len(patterns), 5)
+        self.assertEqual(allowed, {"Dockerfile", "image/mise.toml", "image/mise.lock", "image/customize.sh",
+                                   "image/mise-user.toml", "image/mise-user.lock", "image/customize-user.sh",
+                                   "image/claude-code.version"})
+        self.assertEqual(len(patterns), 9)
         for denied in (".git/config", ".claude/credentials.json", ".aws/credentials", "docs/private.md",
-                       "workspace/secret", "image/secret", "README.md"):
+                       "workspace/secret", "image/secret", "README.md", "image/customize.example.sh"):
             self.assertFalse(any(fnmatch.fnmatchcase(denied, pattern.rstrip("/")) for pattern in allowed), denied)

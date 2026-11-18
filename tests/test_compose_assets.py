@@ -295,5 +295,28 @@ class RuntimeGrantAssetTests(ComposeFixture, unittest.TestCase):
                         self.assertNotIn(forbidden, text)
 
 
+
+
+class BuildContextParsingTests(ComposeFixture, unittest.TestCase):
+    def test_selected_context_and_identity_survive_real_compose_parsing(self):
+        context = self.root / 'literal $TOKEN, space'
+        context.mkdir()
+        project = self.project()
+        class Parser:
+            def run(inner, argv, **kwargs):
+                index = argv.index('build')
+                result = subprocess.run([*argv[:index], '--profile', 'desktop', 'config', '--format', 'json'],
+                                        env=kwargs['env'], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                service = json.loads(result.stdout)['services']['claude-cli']
+                self.assertEqual(service['build']['context'].replace('$$', '$'), str(context))
+                self.assertEqual(service['build']['args']['CLAUDE_UID'], '1234')
+                self.assertEqual(service['image'], f'claude-docker-cli-{os.getuid()}:latest')
+                self.assertEqual(service['labels']['io.github.diborodin.claude-in-docker-linux.owner-uid'], str(os.getuid()))
+                return result
+        project.runner = Parser()
+        project.build('claude-cli', pull=False, no_cache=False, build_context=context)
+
+
 if __name__ == "__main__":
     unittest.main()

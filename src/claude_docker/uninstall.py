@@ -12,15 +12,18 @@ import subprocess
 import sys
 
 from . import desktop
+from .claude_version import code_version_path
 from .commands import CommandRunner
 from .compose import ComposeProject
 from .config import AccountInfo, load_config, resolve_config_file
+from .customize import user_customize_path
 from .desktop import stop_desktop_runtime
 from .installer import (InstallLayout, _check_link, _exists, _owned_directory, _verify_release,
                         installation_lock, _write_json, _sync_directory)
 from .model import AppConfig
 from .manifest import InstallManifest, InstallationRegistry, _read_metadata, validate_version
 from .state import RuntimeState
+from .tool_config import retained_user_tools_paths
 
 
 @dataclass(frozen=True)
@@ -364,10 +367,15 @@ def _protected_data(layout: InstallLayout, *, purge: bool = False) -> tuple[Path
     config = load_config(env=os.environ, paths=paths,
                          account=AccountInfo(account.pw_name, uid, os.getgid(), Path(account.pw_dir)))
     targets = (paths.home / '.claude', paths.home / '.claude.json', paths.home / '.config/Claude',
-               *protected_user_paths(config))
+               *protected_user_paths(config), *retained_user_tools_paths(paths, os.environ))
     if not purge:
         targets += (paths.config_dir, resolve_config_file(env=os.environ, paths=paths))
-    return _aliases(targets)
+    # Keep lexical and resolved paths without opening or validating these inputs.
+    # realpath tolerates broken links and loops.
+    build_inputs = (user_customize_path(paths), code_version_path(paths))
+    build_aliases = (alias for path in build_inputs
+                     for alias in (Path(os.path.abspath(path)), Path(os.path.realpath(path))))
+    return tuple(dict.fromkeys((*_aliases(targets), *build_aliases)))
 
 
 def _purge_inventory(layout: InstallLayout, protected: tuple[Path, ...]) -> _Inventory:

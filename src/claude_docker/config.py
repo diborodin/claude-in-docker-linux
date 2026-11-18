@@ -1,6 +1,6 @@
 """Strict TOML settings and process overrides, without modifying host state."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -181,8 +181,13 @@ def resolve_config_file(*, env: Mapping[str, str], paths: HostPaths,
 
 
 def load_config(*, env: Mapping[str, str], paths: HostPaths, account: AccountInfo,
-                config_file: Path | None = None) -> AppConfig:
-    """Apply validated defaults, selected TOML, then explicit process overrides."""
+                config_file: Path | None = None,
+                report_source: Callable[[Path, bool], None] | None = None) -> AppConfig:
+    """Apply defaults, selected TOML, then process overrides.
+
+    An optional reporter receives the selected path and whether it was opened.
+    Otherwise loading stays silent, including calls from non-CLI code.
+    """
     defaults = {
         "docker_mode": "none",
         "container": {"user": account.name, "uid": account.uid, "gid": account.gid,
@@ -201,11 +206,15 @@ def load_config(*, env: Mapping[str, str], paths: HostPaths, account: AccountInf
         "CLAUDE_CONFIG_FILE" if "CLAUDE_CONFIG_FILE" in env else "config")
     try:
         with selected.open("rb") as stream:
+            if report_source is not None:
+                report_source(selected, True)
             data = tomllib.load(stream)
     except FileNotFoundError:
         if config_file is not None or "CLAUDE_CONFIG_FILE" in env:
             raise ValueError(f"{label}: selected configuration file does not exist: {selected}") from None
         data = {}
+        if report_source is not None:
+            report_source(selected, False)
     except (OSError, tomllib.TOMLDecodeError, UnicodeError):
         raise ValueError(f"{label}: cannot read a valid TOML configuration: {selected}") from None
     values.update(_read_table(data, _SCHEMA, paths.home))

@@ -84,7 +84,41 @@ qualification evidence. It is not a full Desktop production qualification.
    ```
 
 6. Open `~/.config/claude-docker/config.toml` in your editor.
-7. Remove example mount roots that you do not need or that do not exist.
+7. Replace the example mount list with existing workspace roots. For example,
+   set `mounts = ["~/work/git"]` in the existing `[container]` table.
+8. If you want optional kubectl 1.36 and AWS CLI v2, create a user tool profile:
+
+   ```bash
+   claude-docker tools init
+   ```
+
+   Review or edit `~/.config/claude-docker/mise.toml`, then lock its tools:
+
+   ```bash
+   claude-docker tools lock
+   ```
+
+9. If you want the personal build hook, create its example:
+
+   ```bash
+   claude-docker customize init
+   ```
+
+   Review or edit `~/.config/claude-docker/customize.sh` before you build.
+   The example installs `checkbashisms`. It runs as root inside the build.
+   This script needs no `tools lock`.
+10. Check the host and build the CLI image:
+
+    ```bash
+    claude-docker check
+    claude-docker build
+    ```
+
+    Use `claude-docker build --all` to build both CLI and Desktop images.
+
+Steps 8 and 9 are optional. Without these files, the build uses only the base
+tools. Init commands do not overwrite existing files. Mise is not required
+on the host.
 
 The default installation stores versioned program files under
 `~/.local/share/claude-docker/releases`. The command link is
@@ -93,19 +127,15 @@ The default installation stores versioned program files under
 
 ## Start Claude
 
-1. Build the CLI image:
+After you complete the installation and image build:
 
-   ```bash
-   claude-docker build
-   ```
-
-2. Open a terminal in a configured workspace:
+1. Open a terminal in a configured workspace:
 
    ```bash
    cd ~/work/git
    ```
 
-3. Start Claude Code:
+2. Start Claude Code:
 
    ```bash
    claude-docker claude
@@ -137,6 +167,10 @@ See [config.example.toml](config.example.toml) for detailed configuration keys.
 Precedence is process environment overrides, then TOML settings, then detected
 host defaults. CLI identity overrides can change the container account,
 UID, GID, and home. The root account is not supported.
+
+Commands that read configuration print the selected path to standard error.
+If the default file is absent, the message reports the use of defaults and
+environment overrides. Configuration contents and credential values are not printed.
 
 Without a configuration file, the workspace default is `~/work/git`.
 The generated example shows several mount roots. To mount multiple
@@ -409,40 +443,166 @@ After a build or rebuild, stop existing containers before the next start:
 claude-docker stop
 ```
 
-### Add image packages
+### Update Claude Code
 
-Use a trusted source or development checkout. Do not edit an installed bundle.
-For example, to add `bsdextrautils`, add this entry to the existing
-`[bootstrap.packages]` table in `image/mise.toml`. Keep the other entries:
+```bash
+claude-docker build --update-claude
+```
+
+The first build checks for the latest Claude Code release and saves its exact
+version in `~/.config/claude-docker/claude-code.version`. `XDG_CONFIG_HOME`
+changes this location. Later builds use the saved version. Use
+`--update-claude` to check again. Add `--all` for both images or `--desktop`
+for the Desktop image only. The launcher rejects redirects during this check
+and keeps a newer saved version. Raw Docker builds resolve the shipped
+`latest` policy when the artifact layer runs.
+
+The version is saved before Docker builds. If the build fails, retry with
+`build` and the same target option (`--desktop` or `--all`, if used).
+Omit `--update-claude`. Install, uninstall, and purge keep the saved version.
+After a version-only change, `build` can reuse the package, tool, and hook layers.
+`rebuild --update-claude` uses fresh base images and skips the cache.
+Automatic and manual Code updates are disabled in the containers. Run
+`claude-docker stop`, then start Claude to use the new image.
+
+### Add image tools and packages
+
+Installed commands support optional user tools. Create a private example once:
+
+```bash
+claude-docker tools init
+```
+
+Edit `~/.config/claude-docker/mise.toml`. The example installs kubectl from
+the 1.36 series and AWS CLI v2.
+To also add an Ubuntu package, use:
 
 ```toml
+[tools]
+kubectl = "1.36"
+aws-cli = "2"
+
 [bootstrap.packages]
-"apt:bsdextrautils" = "latest"
+"apt:tree" = "latest"
 ```
 
-From that checkout, build both images and remove the old containers:
+The lock selects an exact patch version for each version request.
+
+Lock artifacts, build both images, remove old containers, then launch:
 
 ```bash
-./claude-docker build --all
-./claude-docker stop
+claude-docker tools lock
+claude-docker build --all
+claude-docker stop
+claude-docker claude
 ```
 
-Start a new process with `./claude-docker claude` or `./claude-docker desktop`.
-Use `build` for only CLI, or `build --desktop` for only Desktop.
-The package is available in each rebuilt image. A package installed manually
-in a running container is lost when that container is removed.
+Use `build` for CLI or `build --desktop` for Desktop. Tools are installed in
+system paths outside mounted HOME. Manual container installations are lost
+when the container is removed. Both images include these default tools:
 
-Contributors can use `image/customize.sh` for advanced image changes.
-For tools in the `[tools]` table, refresh the pinned tool lock for both
-architectures from the checkout:
+| Installer | Tools |
+| --- | --- |
+| apt | ripgrep, jq, shellcheck, shfmt, sd, miller, hyperfine, bats, less, bsdextrautils |
+| mise | fd, bat, ast-grep, yq (Mike Farah), gh, uv, difftastic, scc, duckdb |
+
+Miller provides `mlr`. Difftastic provides `difft`. Kubectl remains optional.
+
+The sibling `mise.lock` pins artifacts and checksums for `linux-x64` and
+`linux-arm64`. Ordinary locking preserves matching resolutions. Use
+`claude-docker tools lock --bump` to advance requests. Builds require a matching
+lock and never create or refresh one. Comments and apt edits keep tool locks
+valid. An apt-only profile needs no artifact lock; apt packages are not pinned
+by this lock. The shipped base and user artifact locks are separate.
+
+`XDG_CONFIG_HOME` changes the default directory. `CLAUDE_MISE_CONFIG_FILE`
+selects an absolute or `~/` file, independently of `CLAUDE_CONFIG_FILE`.
+For example, `~/tools/custom.toml` uses the sibling `~/tools/custom.lock`.
+A missing default profile adds no tools. An explicitly selected missing file
+is an error. Init never overwrites a file. The profile and lock
+survive updates, normal uninstall, and purge, including custom locations.
+
+Only `[tools]` and apt-only `[bootstrap.packages]` are supported. Use a single
+version string or a version/options table with scalar backend options.
+Requests must be additive. Baseline removal, other sections, unsupported
+managers, templates, core controls, and dependency sidecars are rejected.
+Checksum and locked-install policy stay program-controlled. Docker receives
+private snapshots of exact build inputs, without sending your HOME,
+configuration directory, or workspace.
+
+Manually migrate old edits from `image/mise.toml` into your user profile, then
+lock and rebuild. Updates do not copy those edits or overwrite user profiles.
+Contributors can edit the baseline hook `image/customize.sh` and run
+`./claude-docker tools lock --base` in a trusted source or development checkout.
+Use `./install --dev` to link a development checkout.
+
+### Activate mise in Claude Code
+
+Merge this entry into `~/.claude/settings.json`. Keep existing settings and hooks.
+The default Claude state mount makes this host file available in the container.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$CLAUDE_ENV_FILE\" ] && echo 'eval \"$(mise hook-env -s bash)\"' >> \"$CLAUDE_ENV_FILE\"; true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If Claude Code runs commands in zsh, replace `-s bash` with `-s zsh`.
+Start a new Claude Code session after the change. Mise runs inside the container;
+it is not required on the host. See the [mise integration instructions](https://mise.jdx.dev/agents.html#claude-code).
+
+### Tell Claude Code which tools to use
+
+You can append this section to the local `~/.claude/CLAUDE.md` file.
+Keep your existing instructions. The default Claude state mount exposes this
+file inside the container.
+
+```markdown
+## System tools
+
+- Search: use `rg` for content and `fd` for file names. Limit output with
+  `rg -l`, `rg -m 5`, and `--max-columns 200`.
+- Replace text: use `sd` for simple replacements and `ast-grep` for structural
+  code changes. Do not use `sed -i`.
+- JSON: use `jq`. YAML, TOML, and XML: use `yq` (the Mike Farah Go version,
+  not the Python wrapper).
+- Tables and logs: use `mlr` for simple transformations. Use
+  `duckdb -c "SELECT ... FROM 'file.csv'"` for aggregation and Parquet.
+- Python: use `uv` instead of pip and venv. GitHub: use `gh`.
+- Repository overview: use `scc`. Code diffs: use `difft`.
+- Bash scripts: run `shellcheck` before you finish. For scripts that must work
+  with POSIX sh, check portability with `dash script.sh`. Write tests with
+  `bats`. To debug, use `PS4='+ ${BASH_SOURCE}:${LINENO}: ' bash -x script.sh`.
+```
+
+### Run a personal build script
+
+Create a private script that installs `checkbashisms` on the next image build:
 
 ```bash
-./claude-docker tools lock
+claude-docker customize init
 ```
 
-This contributor command runs the pinned tool manager through Docker.
-It is refused in installed bundles. For a development link, use
-`./install --dev` from a trusted source checkout.
+Edit `~/.config/claude-docker/customize.sh`. `XDG_CONFIG_HOME` changes the
+default directory. The script runs as root after tool setup in each image
+build, before the image contains Claude Code. The example installs to
+`/usr/local/bin`, outside mounted HOME.
+Run `claude-docker build --all`, run `claude-docker stop`, then start Claude.
+Artifact locks apply to the mise profile. Keep secrets out of your script.
+Docker receives its contents. Environment forwarding applies when Claude starts.
+To disable the script, rename it and build again. Updates, uninstall, and
+purge retain the script.
 
 For implementation details, see [architecture](docs/architecture.md) and
 [Desktop security](docs/desktop-security.md).
@@ -504,11 +664,7 @@ before you retry.
 
 The following work is not complete. Items are listed in the proposed order.
 
-- [ ] Separate the base image tools from user tools. Keep `image/mise.toml` as
-  the base. Add an optional `~/.config/claude-docker/mise.toml` for user packages
-  and tools. Define override rules, separate lock files, and reproducible build
-  inputs. Support installed releases without editing their immutable bundles.
-- [ ] Pin Claude Code and Desktop versions and document how to update them.
+- [ ] Pin the Claude Desktop application package and document how to update it.
 - [ ] Add CI for unit tests, image builds, and release archive checksums.
 - [ ] Complete interactive CLI checks on Debian 13 and Ubuntu 24.04.
   Build and test the arm64 images.

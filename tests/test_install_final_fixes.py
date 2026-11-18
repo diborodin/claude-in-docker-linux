@@ -253,6 +253,91 @@ class FinalInstallFixTests(unittest.TestCase):
         self.assertFalse((self.program / 'removal-intent.json').exists())
         self.assertFalse(self.command.is_symlink())
 
+    def test_installed_02_to_03_update_and_both_removal_modes_retain_user_tools(self):
+        default = self.root / 'config/claude-docker/mise.toml'
+        custom = self.root / 'cache/claude-docker/custom.toml'
+        files = (default, default.with_suffix('.lock'), custom, custom.with_suffix('.lock'))
+        self.env['CLAUDE_MISE_CONFIG_FILE'] = str(custom)
+        for purge in (False, True):
+            with self.subTest(purge=purge):
+                for path in files:
+                    self.write(path, 'invalid TOML or stale lock [')
+                before = {path: self.snapshot(path) for path in files}
+                for version in ('0.2.0', '0.3.0'):
+                    (self.source / 'VERSION').write_text(version + '\n')
+                    (self.source / 'src/claude_docker/__init__.py').write_text(
+                        f'__version__ = "{version}"\n')
+                    self.run_command(self.source / 'install')
+                    for path in files:
+                        self.assertEqual(self.snapshot(path), before[path])
+                self.assertEqual(self.run_command(self.command, '--version'), 'claude-docker 0.3.0\n')
+                self.run_command(self.command, 'uninstall', *(['--purge', '--yes'] if purge else []))
+                self.assertFalse(self.command.is_symlink())
+                for path in files:
+                    self.assertEqual(self.snapshot(path), before[path])
+
+    def test_purge_retry_retains_original_user_tool_selection_after_environment_changes(self):
+        self.run_command(self.source / 'install')
+        protected = self.program / 'releases/0.1.0/README.md'
+        original = protected.read_bytes()
+        alias = self.home / 'optional.toml'
+        alias.symlink_to(protected)
+        self.write(alias.with_suffix('.lock'), 'invalid stale lock')
+        self.env['CLAUDE_MISE_CONFIG_FILE'] = str(alias)
+        target = self.program / 'releases/0.1.0/src/claude_docker/installer.py'
+        failed = self.invoke('runtime', 'uninstall', '--purge', '--yes', hook='fail', target=target)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('injected deletion interruption', failed.stderr)
+        self.assertEqual(protected.read_bytes(), original)
+        self.env['CLAUDE_MISE_CONFIG_FILE'] = str(self.home / 'missing.toml')
+        (self.bin_dir / 'docker').unlink()
+        retried = self.invoke('--uninstall')
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(protected.read_bytes(), original)
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(alias.with_suffix('.lock').read_text(), 'invalid stale lock')
+        self.assertFalse(self.command.is_symlink())
+
+    def test_purge_retry_retains_original_customize_alias_target_after_retargeting(self):
+        self.run_command(self.source / 'install')
+        protected = self.program / 'releases/0.1.0/README.md'
+        original = protected.read_bytes()
+        alias = self.root / 'config/claude-docker/customize.sh'
+        alias.parent.mkdir(parents=True, mode=0o700)
+        alias.symlink_to(protected)
+        target = self.program / 'releases/0.1.0/src/claude_docker/installer.py'
+        failed = self.invoke('runtime', 'uninstall', '--purge', '--yes', hook='fail', target=target)
+        self.assertIn('injected deletion interruption', failed.stderr)
+        self.assertTrue(protected.is_file(), 'purge deleted the selected hook target')
+        self.assertEqual(protected.read_bytes(), original)
+        alias.unlink()
+        alias.symlink_to(self.root / 'missing')
+        retried = self.invoke('--uninstall')
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(protected.read_bytes(), original)
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(self.command.is_symlink())
+
+    def test_purge_retry_retains_original_code_version_alias_target_after_retargeting(self):
+        self.run_command(self.source / 'install')
+        protected = self.program / 'releases/0.1.0/README.md'
+        original = protected.read_bytes()
+        alias = self.root / 'config/claude-docker/claude-code.version'
+        alias.parent.mkdir(parents=True, mode=0o700)
+        alias.symlink_to(protected)
+        target = self.program / 'releases/0.1.0/src/claude_docker/installer.py'
+        failed = self.invoke('runtime', 'uninstall', '--purge', '--yes', hook='fail', target=target)
+        self.assertIn('injected deletion interruption', failed.stderr)
+        self.assertTrue(protected.is_file(), 'purge deleted the selected version pin target')
+        self.assertEqual(protected.read_bytes(), original)
+        alias.unlink()
+        alias.symlink_to(self.root / 'missing')
+        retried = self.invoke('--uninstall')
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(protected.read_bytes(), original)
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse(self.command.is_symlink())
+
     def test_recorded_launch_without_docker_stays_fail_closed_until_retry(self):
         self.run_command(self.source / 'install')
         self.write(self.root / 'state/claude-docker/active-mode', 'none\n')
@@ -278,12 +363,18 @@ class FinalInstallFixTests(unittest.TestCase):
         docker = self.bin_dir / 'docker'
         docker.write_text('#!' + sys.executable + '\nfrom pathlib import Path\np = Path(' + repr(str(log)) + ')\np.write_text(p.read_text() + "run\\n" if p.exists() else "run\\n")\n')
         docker.chmod(0o755)
-        self.run_command(self.source / 'claude-docker', 'tools', 'lock')
+        config_file = self.root / 'config/claude-docker/config.toml'
+        notice = f'claude-docker: config: {config_file} (not found; using defaults and environment overrides)\n'
+        notice += f'claude-docker: tools: {self.source / "image/mise.toml"}\n'
+        from tests.test_tool_config import NATIVE_LOCK
+        (self.source / 'image/mise.toml').write_text('[tools]\nkubectl="latest"\n')
+        (self.source / 'image/mise.lock').write_text(NATIVE_LOCK)
+        self.run_command(self.source / 'claude-docker', 'tools', 'lock', '--base', expected_stderr=notice)
         self.run_command(self.source / 'install', '--dev')
-        self.run_command(self.command, 'tools', 'lock')
+        self.run_command(self.command, 'tools', 'lock', '--base', expected_stderr=notice)
         self.assertEqual(log.read_text().splitlines(), ['run', 'run'])
 
-    def test_installed_user_and_system_tools_lock_refuses_before_docker(self):
+    def test_installed_user_and_system_user_lock_allowed_base_refused(self):
         log = self.root / 'docker-called'
         docker = self.bin_dir / 'docker'
         docker.write_text('#!' + sys.executable + '\nfrom pathlib import Path\nPath(' + repr(str(log)) + ').touch()\n')
@@ -294,9 +385,22 @@ class FinalInstallFixTests(unittest.TestCase):
                 arguments = ('--system',) if mode == 'system' else ()
                 self.assertEqual(self.invoke(*arguments, prefix=prefix).returncode, 0)
                 command = self.root / 'prefix/bin/claude-docker' if mode == 'system' else self.command
-                result = subprocess.run([str(command), 'tools', 'lock'], env=self.env, capture_output=True, text=True)
+                result = subprocess.run([str(command), 'tools', 'lock', '--base'], env=self.env, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('checkout', result.stderr.lower())
                 self.assertFalse(log.exists())
+                profile = self.root / 'selected-tools.toml'
+                profile.write_text('[tools]\nkubectl="latest"\n')
+                from tests.test_tool_config import NATIVE_LOCK
+                profile.with_suffix('.lock').write_text(NATIVE_LOCK)
+                user_env = dict(self.env, CLAUDE_MISE_CONFIG_FILE=str(profile))
+                installed = command.resolve().parent
+                before = self.snapshot(installed)
+                result = subprocess.run([str(command), 'tools', 'lock'], env=user_env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(log.exists())
+                self.assertEqual(self.snapshot(installed), before)
+                self.assertIn(str(profile), result.stderr)
+                log.unlink()
                 result = self.invoke('--uninstall', *arguments, prefix=prefix)
                 self.assertEqual(result.returncode, 0, result.stderr)

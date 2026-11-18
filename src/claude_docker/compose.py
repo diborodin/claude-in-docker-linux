@@ -6,8 +6,11 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 
-from .commands import CommandRunner
+from .commands import CommandRunner, docker_environment
+from .image_tools import image_build_inputs
 from .model import (AppConfig, BindMount, ContainerConfig, DesktopConfig, DesktopRuntime,
                     EnvironmentConfig, StateMountConfig)
 from .paths import HostPaths, _private_runtime, resolve_program_dir
@@ -15,13 +18,6 @@ from .process import docker_exec_argv
 from .state import RuntimeState
 
 
-# Keep Docker client configuration usable while excluding arbitrary application
-# credentials and ambient Compose settings. Container credentials use docker exec.
-_DOCKER_ENVIRONMENT = (
-    'PATH', 'HOME', 'XDG_RUNTIME_DIR', 'DOCKER_HOST', 'DOCKER_CONTEXT',
-    'DOCKER_CONFIG', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_API_VERSION',
-    'SSH_AUTH_SOCK', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
-)
 _SERVICES = ('claude-cli', 'claude-desktop')
 
 
@@ -65,7 +61,7 @@ class ComposeProject:
             'CLAUDE_HOME': str(config.container.home),
             'CLAUDE_HOST_UID': str(self.host_uid),
         }
-        self.environment = {key: os.environ[key] for key in _DOCKER_ENVIRONMENT if key in os.environ}
+        self.environment = docker_environment(os.environ)
         self.environment.update(self.scalars)
         self.environment['COMPOSE_DISABLE_ENV_FILE'] = '1'
         self.state = RuntimeState(paths.state_dir)
@@ -186,12 +182,18 @@ class ComposeProject:
         # Compose may create resources before failing on dependency health.
         # Persist recovery information before up, without claiming success.
         self.state.write_pending(self.config.docker_mode)
-        options = ['up', '-d']
+        options = ['up', '-d', '--no-build', '--pull', 'never']
         if recreate:
             options.append('--force-recreate')
             if old == self.config.docker_mode and pending is None:
                 options.append('--no-deps')
-        self._run(*options, service)
+        try:
+            self._run(*options, service)
+        except subprocess.CalledProcessError:
+            selection = ' --desktop' if service == 'claude-desktop' else ''
+            print(f'claude-docker: If the image is missing, run claude-docker build{selection} first',
+                  file=sys.stderr)
+            raise
         self.state.write_mode(self.config.docker_mode)
         self.state.clear_pending()
 
@@ -262,14 +264,32 @@ class ComposeProject:
         # environment. Values never enter arguments or Compose configuration.
         return self.runner.run(argv, check=False, capture_output=capture_output).returncode
 
-    def build(self, service: str, *, pull: bool, no_cache: bool) -> None:
+    def build(self, service: str, *, pull: bool, no_cache: bool,
+              build_context: Path | None = None) -> None:
         self._service(service)
+        if self._teardown_only:
+            raise ValueError('Recovery project permits mount-free teardown only')
+        if build_context is None:
+            with image_build_inputs(self.program_dir, self.paths, os.environ) as context:
+                self.build(service, pull=pull, no_cache=no_cache, build_context=context)
+            return
         args = ['build']
         if pull:
             args.append('--pull')
         if no_cache:
             args.append('--no-cache')
-        self._run(*args, service, runtime_mounts=False)
+        # Build-only override: runtime mounts and installed files remain untouched.
+        with tempfile.TemporaryDirectory(prefix='claude-image-compose-') as temporary:
+            override = Path(temporary) / 'build.json'
+            descriptor = os.open(override, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                json.dump({'services': {service: {'build': {
+                    'context': _literal(str(build_context)),
+                    'args': {key: _literal(value) for key, value in self.scalars.items()}}}}}, stream)
+            command = self.command(*args, service, runtime_mounts=False)
+            index = command.index('build')
+            command[index:index] = ['-f', str(override)]
+            self.runner.run(command, env=self.environment)
 
     def pull(self) -> None:
         if self.config.docker_mode == 'sysbox':
