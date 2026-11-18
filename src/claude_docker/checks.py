@@ -13,7 +13,7 @@ from typing import Literal
 from .commands import CommandRunner
 from .compose import ComposeProject, validate_desktop_uid
 from .model import AppConfig
-from .paths import resolve_program_dir
+from .seccomp_cache import ProfileNotCached
 from .seccomp import resolve_desktop_seccomp
 
 
@@ -129,19 +129,17 @@ def run_checks(config: AppConfig, *, smoke: bool, runner: CommandRunner,
             'Requested policy for next Desktop start: ' +
             ('Chromium sandbox disabled (unsafe).' if unsafe else 'Chromium sandbox enabled.')))
         try:
-            # Default policy has no packaged-asset dependency or daemon probes.
-            selected_program = program_dir
-            if selected_program is None and config.desktop.seccomp != 'default':
-                selected_program = resolve_program_dir(
-                    Path(__file__).resolve().parents[2] / 'claude-docker', os.environ)
-            resolve_desktop_seccomp(config, runner,
-                                    program_dir=selected_program or Path('.'), unsafe=unsafe)
+            resolve_desktop_seccomp(config, runner, program_dir=program_dir or Path('.'),
+                                    unsafe=unsafe, create=False)
+        except ProfileNotCached:
+            results.append(CheckResult('desktop-seccomp', 'warning',
+                'Requested policy for next Desktop start: chromium. First launch needs HTTPS to resolve the matching profile.'))
         except ValueError as error:
             results.append(CheckResult('desktop-seccomp', 'error', str(error)))
         else:
             results.append(CheckResult('desktop-seccomp', 'ok',
                 'Requested policy for next Desktop start: ' + config.desktop.seccomp +
-                ('. Bundled asset integrity and selected-daemon compatibility verified.'
+                ('. Matching cached profile verified.'
                  if config.desktop.seccomp == 'chromium' else '. Docker default policy.')))
         results.append(CheckResult('desktop-lifetime', 'warning',
             'Running Desktop lifetime was not verified. Existing per-run sandbox, clipboard and '

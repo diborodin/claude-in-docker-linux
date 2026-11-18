@@ -230,8 +230,8 @@ class ClaudeVersionTests(unittest.TestCase):
         (checkout / 'image').mkdir(parents=True)
         (checkout / 'image/claude-code.version').write_bytes(b'2.1.326\n')
         layout = InstallLayout.user(self.env)
-        install_release(ROOT, layout, version='0.3.4')
-        installed = layout.release_dir('0.3.4')
+        install_release(ROOT, layout, version='0.3.7')
+        installed = layout.release_dir('0.3.7')
         self.pin.parent.parent.mkdir(parents=True)
         for program in (checkout, installed):
             with self.subTest(program=program):

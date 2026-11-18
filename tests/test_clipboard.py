@@ -300,6 +300,7 @@ class ClipboardModeTests(ComposeFixture, unittest.TestCase):
         patch.object(desktop.XephyrManager, 'load', return_value=None).start()
         patch.object(desktop.XephyrManager, 'start', side_effect=lambda: self.events.append('start') or self.runtime).start()
         patch.object(desktop.XephyrManager, 'stop', side_effect=lambda runtime: self.events.append('stop')).start()
+        patch.object(desktop.XephyrManager, 'stop_recorded', side_effect=lambda **kwargs: self.events.append('stop')).start()
         patch.object(desktop.time, 'sleep').start()
         self.stdout, self.stderr = io.StringIO(), io.StringIO()
 
@@ -334,6 +335,7 @@ class ClipboardModeTests(ComposeFixture, unittest.TestCase):
 
     def test_restart_stops_worker_before_rotating_authority(self):
         from claude_docker import clipboard
+        self.project().state.write_mode('none')
         with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime), \
                 patch.object(clipboard.ClipboardSync, 'stop_recorded', side_effect=lambda: self.events.append('clipboard-stop')):
             self.assertEqual(self.launch(restart=True), 0)

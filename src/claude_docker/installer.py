@@ -20,7 +20,7 @@ from .paths import HostPaths, resolve_host_paths
 
 # Deliberately enumerate program inputs: never sweep checkout state or new files
 # into the bundle merely because they happen to live under a runtime directory.
-BUNDLE_FILES = (
+_STATIC_POLICY_FILES = (
     ".dockerignore", "claude-docker", "install", "VERSION", "README.md", "LICENSE",
     "Dockerfile", "compose.yaml", "compose.sysbox.yaml", "config.example.toml",
     "image/claude-code.version", "image/customize.sh", "image/customize.example.sh", "image/mise.lock", "image/mise.toml",
@@ -40,11 +40,18 @@ BUNDLE_FILES = (
 )
 
 
+BUNDLE_FILES = tuple(path for path in _STATIC_POLICY_FILES
+                     if path != "security/desktop-seccomp-v0.2.4-linux-amd64.json") + (
+    "src/claude_docker/seccomp_source.py", "src/claude_docker/seccomp_profile.py",
+    "src/claude_docker/seccomp_cache.py",
+)
+
+
 # These are exact historical inventories, not permission to omit individual
 # current inputs. Earlier releases had 39 files before Claude Code pinning,
 # 37 before user customization, 35 before user tool profiles, 34 before the license,
 # 30 before the policy assets, and 29 before uninstall.py.
-_PRE_CODE_VERSION_FILES = frozenset(BUNDLE_FILES) - {
+_PRE_CODE_VERSION_FILES = frozenset(_STATIC_POLICY_FILES) - {
     "image/claude-code.version", "src/claude_docker/claude_version.py",
 }
 _PRE_CUSTOMIZE_FILES = _PRE_CODE_VERSION_FILES - {"image/customize.example.sh", "src/claude_docker/customize.py"}
@@ -57,7 +64,7 @@ _PRE_POLICY_FILES = _PRE_LICENSE_FILES - {
     "security/desktop-seccomp-v0.2.4-linux-amd64.json",
     "security/LICENSE.moby-profiles", "security/NOTICE.moby-profiles",
 }
-_RELEASE_INVENTORIES = (frozenset(BUNDLE_FILES), _PRE_CODE_VERSION_FILES, _PRE_CUSTOMIZE_FILES,
+_RELEASE_INVENTORIES = (frozenset(BUNDLE_FILES), frozenset(_STATIC_POLICY_FILES), _PRE_CODE_VERSION_FILES, _PRE_CUSTOMIZE_FILES,
                         _PRE_USER_TOOLS_FILES, _PRE_LICENSE_FILES, _PRE_POLICY_FILES,
                         _PRE_POLICY_FILES - {"src/claude_docker/uninstall.py"})
 

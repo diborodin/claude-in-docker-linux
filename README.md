@@ -46,17 +46,17 @@ For the normal CLI path, install these host prerequisites:
 
 Use your distribution or Docker vendor instructions to install prerequisites.
 The launcher does not install host packages or change Docker settings.
-Image tools run inside Docker; they need no separate host tool manager.
+Images use Ubuntu 26.04. Image tools need no separate host tool manager.
 
-The matrix separates intended reference configurations from actual
-qualification evidence. It is not a full Desktop production qualification.
+Ubuntu 26.04 CLI and Desktop image/tool checks passed on amd64. The Ubuntu 26.04.1 LTS
+Desktop image also passed the Chromium-policy GUI test on Docker 29.10.0.
 
 | Configuration | Intended reference | Actual qualification in this series |
 | --- | --- | --- |
-| CLI, no inner Docker, amd64 | Debian 13; Ubuntu 24.04 | Image and CLI image-runtime checks passed on the Debian 13 Docker host. Full interactive host-identity qualification remains open. |
+| CLI, no inner Docker, amd64 | Debian 13; Ubuntu 24.04 | Ubuntu 26.04 image and CLI image-runtime checks passed on the Debian 13 Docker host. Full interactive host-identity qualification remains open. |
 | CLI, no inner Docker, arm64 | Debian 13; Ubuntu 24.04 | arm64 build and runtime not executed. |
-| Desktop, amd64 | Linux graphical session with Xephyr | The default-policy sandboxed Desktop FAILED on the Debian 13 Docker host: namespace EPERM, exit 133. Xauthority, nested clipboard, and cleanup checks passed. No unsafe fallback was used. |
-| Desktop with explicit chromium policy, amd64 | Docker Engine Community 29.9.2, Linux amd64, no inner Docker | Real host-identity launcher/Xephyr qualification is described below. Default-policy failure remains separate. |
+| Desktop, amd64 | Linux graphical session with Xephyr | Historically, the Ubuntu 24.04 default-policy sandboxed Desktop FAILED on the Debian 13 Docker host: namespace EPERM, exit 133. Xauthority, nested clipboard, and cleanup checks passed. No unsafe fallback was used. |
+| Desktop with explicit chromium policy, amd64 | Docker Engine Community 29.10.0, Debian 13 amd64, no inner Docker | The Ubuntu 26.04.1 LTS image passed the real host-identity launcher/Xephyr test described below. |
 | Desktop, arm64 | Linux graphical session with Xephyr | Not executed. |
 | Inner Docker with Sysbox | Ubuntu 24.04 | Live Sysbox and nested Docker not executed. Debian 13 is experimental. |
 | Shared system install | Linux with administrator installation | Temporary simulated layouts tested; real privileged and cross-account use not executed. |
@@ -294,7 +294,7 @@ A shared Desktop profile can cause profile locking and concurrent-write errors.
    ```
 
 The default setting is `seccomp = "default"` in `[desktop]`. It preserves
-Docker policy. To request the bundled Chromium policy, set this in TOML:
+Docker policy. To request the Chromium policy, set this in TOML:
 
 ```toml
 [desktop]
@@ -302,17 +302,18 @@ seccomp = "chromium"
 ```
 
 `CLAUDE_DESKTOP_SECCOMP` overrides TOML. Only `default` and `chromium` are
-accepted. The chromium option supports only a Linux amd64 (x86_64) daemon
-running Docker Engine Community 29.9.2 with builtin seccomp enabled and
-`docker_mode = "none"`. Sysbox and unknown daemon versions are rejected.
-This policy permits four exact kernel namespace creation operations and
-expands the kernel attack surface. It cannot be combined with disabling
-the internal sandbox. There is no automatic fallback if startup fails.
-Use `claude-docker desktop --restart` to apply a changed setting.
+accepted. Chromium requires Linux amd64 and builtin seccomp. In both
+`none` and `sysbox` modes, the launcher reads the outer daemon GitCommit.
+First launch uses HTTPS to match that commit to an official Moby release tag and resolve its profile.
+This traces source provenance and cannot detect unpublished vendor changes.
+A matching verified cache works offline. A Docker update selects a new
+cache entry automatically. Resolution errors stop launch with no automatic fallback.
+Four exact kernel namespace operations expand the kernel attack surface. Keep the internal sandbox enabled. Use `claude-docker desktop --restart`
+when the running profile differs. Restart clears stale Xephyr state and recreates only Desktop; it requires an unchanged Docker mode with no pending transition. Xephyr disables MIT-SHM to keep container IPC private. Live Sysbox remains unqualified.
 
-The opted-in real launcher qualification observed authenticated Xephyr,
-a Claude window, renderer user/PID namespaces, zero capabilities,
-NoNewPrivs and two seccomp filters, and a GPU PID stable for 20 seconds.
+On Docker 29.10.0, the unwrapped launcher applied the Moby v0.3.0 baseline plus four rules. Authenticated Xephyr displayed a Claude window.
+Three renderers had separate user/PID namespaces, zero capabilities, NoNewPrivs and two seccomp filters.
+The main and GPU processes stayed stable for 20 seconds, and normal stop cleaned up the session.
 Renderer evidence does not certify the internal GPU sandbox: an additional
 GPU filter was not established. Login, real profiles, host clipboard,
 other daemon versions, arm64 and live Sysbox remain unqualified.
@@ -346,13 +347,11 @@ claude-docker desktop --restart
 
 ## Use inner Docker
 
-Enable inner Docker only if you need to build or run containers from Claude.
-Install Sysbox separately and register the `sysbox-runc` runtime with Docker.
-Ubuntu 24.04 is the intended reference host for this mode.
+To build or run containers from Claude, install Sysbox and register the
+`sysbox-runc` runtime with Docker. Ubuntu 24.04 is the intended reference host.
 
-Debian 13 Sysbox use is experimental. Known Sysbox filesystem hangs can
-make the host unresponsive. Live Sysbox was not tested in this series.
-Do not use a successful CLI check as evidence of nested Docker qualification.
+Debian 13 Sysbox use is experimental. Filesystem hangs can make the host
+unresponsive. Live Sysbox and nested Docker qualification remains open.
 
 1. Stop the current containers:
 
@@ -384,9 +383,12 @@ Do not use a successful CLI check as evidence of nested Docker qualification.
    claude-docker claude
    ```
 
-The inner daemon uses mutual TLS and a managed data volume. It does not
-connect to the host Docker socket. To return to the default mode, stop the
-containers and set `docker_mode = "none"`.
+On Desktop launch, restart, or reuse, the launcher creates or starts inner Docker
+as needed and waits up to 120 seconds for health before changing the Desktop
+session. Dependency repair keeps existing containers. If the image is missing, run `claude-docker pull` before retrying.
+
+The inner daemon uses mutual TLS and a managed data volume. To switch back
+to the default mode, stop the containers and set `docker_mode = "none"`.
 
 If you intend to permanently delete the managed inner Docker data, stop
 its containers first. Then request the volume inventory and confirmation:
@@ -395,8 +397,7 @@ its containers first. Then request the volume inventory and confirmation:
 claude-docker cleanup inner-docker
 ```
 
-For noninteractive deletion, add `--yes`. Cleanup validates the exact volume
-name and ownership labels before deletion.
+Use `--yes` for noninteractive deletion. Cleanup verifies volume names and ownership labels.
 
 ## Check the system
 
@@ -671,7 +672,7 @@ The following work is not complete. Items are listed in the proposed order.
 - [ ] Extend Desktop checks to login, session resume, real profiles, host
   clipboard transfers, and the internal GPU sandbox. Review other Docker versions.
 - [ ] Test Sysbox and inner Docker on Ubuntu 24.04. Investigate Debian 13 hangs.
-  Test Desktop with Sysbox separately before allowing the Chromium policy there.
+  Qualify Desktop with the Chromium policy in Sysbox mode separately.
 - [ ] Test shared system installation and removal with separate real accounts.
 
 ## License
@@ -680,6 +681,5 @@ Copyright (C) 2026 Claude in Docker for Linux contributors.
 
 The original project code and documentation use GNU GPL version 3 only
 (`GPL-3.0-only`). See [LICENSE](LICENSE). The program comes without warranty.
-The bundled Moby seccomp profile retains Apache 2.0; see its
-[license](security/LICENSE.moby-profiles) and [notice](security/NOTICE.moby-profiles).
+Moby seccomp profiles use Apache 2.0. See the [license](security/LICENSE.moby-profiles) and [notice](security/NOTICE.moby-profiles).
 Claude and other third-party software retain their own licenses.

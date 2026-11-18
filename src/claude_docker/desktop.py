@@ -219,7 +219,7 @@ class XephyrManager:
                 # Inherit the retained directory so Xephyr's authority reads also
                 # stay anchored if the lexical runtime path is substituted.
                 argv = ['Xephyr', f':{display}', '-auth', f'/proc/self/fd/{runtime_fd}/Xauthority',
-                        '-nolisten', 'tcp', '-screen', self.screen]
+                        '-nolisten', 'tcp', '-extension', 'MIT-SHM', '-screen', self.screen]
                 if self.resize:
                     argv.append('-resizeable')
                 process = subprocess.Popen(argv, start_new_session=True, pass_fds=(runtime_fd,),
@@ -316,7 +316,8 @@ class XephyrManager:
                 if (type(identity.pid) is not int or type(identity.start_ticks) is not int
                         or expected is None or identity.executable != str(Path(expected).resolve())
                         or process_identity(identity.pid) != identity):
-                    raise ValueError('Invalid or stale recorded Desktop runtime; stop it first')
+                    raise ValueError('Invalid or stale recorded Desktop runtime; '
+                                     'run claude-docker desktop --restart')
                 directory = desktop_socket_dir(os.getuid())
                 authority = self.paths.runtime_dir / 'Xauthority'
                 if value['socket_dir'] != str(directory) or value['xauthority'] != str(authority):
@@ -400,11 +401,12 @@ class XephyrManager:
     def stop(self, runtime: DesktopRuntime) -> None:
         self._stop_recorded(runtime, strict_socket=False)
 
-    def stop_recorded(self) -> None:
+    def stop_recorded(self, *, require_xephyr: bool = False) -> None:
         """Teardown needs the record, not a live display or installed GUI tools."""
-        self._stop_recorded(None, strict_socket=True)
+        self._stop_recorded(None, strict_socket=True, require_xephyr=require_xephyr)
 
-    def _stop_recorded(self, runtime: DesktopRuntime | None, *, strict_socket: bool) -> None:
+    def _stop_recorded(self, runtime: DesktopRuntime | None, *, strict_socket: bool,
+                       require_xephyr: bool = False) -> None:
         if runtime is not None:
             current = process_identity(runtime.xephyr_identity.pid)
             if current is not None and current != runtime.xephyr_identity:
@@ -449,6 +451,10 @@ class XephyrManager:
                     raise ValueError('Recorded Desktop runtime paths no longer match')
             except (KeyError, TypeError, UnicodeError, json.JSONDecodeError):
                 raise ValueError('Invalid recorded Desktop runtime') from None
+            if require_xephyr:
+                expected = shutil.which('Xephyr')
+                if expected is None or identity.executable != str(Path(expected).resolve()):
+                    raise ValueError('Recorded process is not the expected Xephyr executable')
             self._check_directory(self.paths.runtime_dir, descriptor)
             self._terminate(identity)
             failures = []
@@ -539,6 +545,25 @@ def _desktop_running(project: ComposeProject, container: str) -> bool:
     return result.returncode == 0
 
 
+def _matches_running_policy(project: ComposeProject, container: str, desired: Path | None) -> bool:
+    result = project.runner.run(['docker', 'inspect', '--format', '{{json .HostConfig.SecurityOpt}}',
+                                 container], env=project.environment, capture_output=True)
+    options = json.loads(result.stdout)
+    if options is None:
+        options = []
+    if not isinstance(options, list) or not all(isinstance(item, str) for item in options):
+        raise ValueError('Cannot verify running Desktop seccomp policy')
+    policies = [item[8:] for item in options if item.startswith(('seccomp=', 'seccomp:'))]
+    if desired is None:
+        return not policies or policies == ['builtin']
+    if len(policies) != 1:
+        return False
+    try:
+        return json.loads(policies[0]) == json.loads(desired.read_bytes())
+    except ValueError:
+        return False
+
+
 def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
                    no_sandbox: bool, app_args: Sequence[str]) -> int:
     """Launch a detached Desktop with fresh process-scoped host credentials."""
@@ -555,6 +580,8 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
                                       os.environ)
     runner = CommandRunner()
     desktop_seccomp = resolve_desktop_seccomp(config, runner, program_dir=program_dir, unsafe=unsafe)
+    if desktop_seccomp is not None and config.docker_mode == 'sysbox':
+        print('WARNING: Chromium seccomp with Sysbox has not been live-qualified.', file=sys.stderr)
     mounts = prepare_mounts(config)
     if not os.environ.get('DISPLAY'):
         raise ValueError('Desktop requires a host DISPLAY')
@@ -567,14 +594,27 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
     synchronize = clipboard_sync or config.desktop.clipboard == 'bidirectional'
     if synchronize and shutil.which('xclip') is None:
         raise ValueError('Clipboard synchronization requires xclip')
-    runtime = manager.load()
+    # Restart uses the recorded teardown path, which also handles a dead
+    # Xephyr. Loading first would reject the stale record before cleanup.
+    runtime = None if restart else manager.load()
     project = ComposeProject(config, paths, mounts, runner, program_dir=program_dir,
                              desktop_runtime=runtime, desktop_seccomp=desktop_seccomp)
-    if runtime is not None:
+    if restart:
+        old_mode = project.state.read_mode()
+        if (project.state.read_pending() is not None
+                or old_mode not in (None, config.docker_mode)):
+            raise ValueError('Desktop-only restart requires an unchanged Docker mode '
+                             'with no pending transition. Start the selected mode separately first.')
+    if not restart:
         container = project.running_container_id('claude-desktop', runtime_mounts=False)
-        if (container is not None and _desktop_running(project, container) and not restart
-                and project.state.read_mode() == config.docker_mode
-                and project.state.read_pending() is None):
+        if container is not None and not _matches_running_policy(project, container, desktop_seccomp):
+            raise ValueError('Running Desktop seccomp policy differs from the selected policy. '
+                             'Use desktop --restart to apply it.')
+        if (runtime is not None and container is not None and project.state.read_mode() == config.docker_mode
+                and project.state.read_pending() is None and _desktop_running(project, container)):
+            project.ensure_inner_docker()
+            if config.docker_mode == 'sysbox':
+                project.state.require_modes(config.docker_mode, None)
             if synchronize:
                 warn_sync()
                 sync.start(runtime, host_display=os.environ['DISPLAY'])
@@ -584,14 +624,17 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
                   'Use desktop --restart to apply current host credentials and launch policy.')
             return 0
     if restart:
+        project.ensure_inner_docker()
+        if config.docker_mode == 'sysbox':
+            project.state.require_modes(old_mode, None)
         sync.stop_recorded()
         project.stop_service('claude-desktop')
-        if runtime is not None:
-            manager.stop(runtime)
-            runtime = None
+        manager.stop_recorded(require_xephyr=True)
     created_runtime = False
     completed = False
-    try:
+
+    def prepare_runtime() -> None:
+        nonlocal runtime, created_runtime
         if runtime is None:
             runtime = manager.start()
             created_runtime = True
@@ -599,7 +642,18 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
         if desktop_seccomp is not None:
             sys.stderr.write("WARNING: Desktop chromium seccomp policy permits selected kernel namespace "
                              "creation operations beyond Docker's default.\n")
-        project.up('claude-desktop', recreate=restart)
+
+    try:
+        if restart:
+            prepare_runtime()
+            project.recreate_desktop()
+            if old_mode is None:
+                project.state.write_mode_if_absent(config.docker_mode)
+        elif config.docker_mode == 'sysbox':
+            project.up('claude-desktop', before_start=prepare_runtime)
+        else:
+            prepare_runtime()
+            project.up('claude-desktop')
         container = project.container_id('claude-desktop')
         socket_check = docker_exec_argv(container, ['test', '-S', f'/tmp/.X11-unix/X{runtime.display}'],
                                        workdir=config.container.home, env_names=(),

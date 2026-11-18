@@ -1,10 +1,11 @@
 """Structured Compose overrides and mode-aware Docker orchestration."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from .state import RuntimeState
 
 
 _SERVICES = ('claude-cli', 'claude-desktop')
+_LABEL = 'io.github.diborodin.claude-in-docker-linux.'
 
 
 def _literal(value: str) -> str:
@@ -107,8 +109,7 @@ class ComposeProject:
         self._validate_mounts()
         services = {}
         desktop_target = self.config.container.home / '.config/Claude'
-        labels = {'io.github.diborodin.claude-in-docker-linux.managed': 'true',
-                  'io.github.diborodin.claude-in-docker-linux.owner-uid': str(self.host_uid)}
+        labels = {_LABEL + 'managed': 'true', _LABEL + 'owner-uid': str(self.host_uid)}
         for name in _SERVICES:
             volumes = []
             for mount in self.mounts:
@@ -168,25 +169,48 @@ class ComposeProject:
         project._teardown_only = self._teardown_only
         return project
 
-    def up(self, service: str, *, recreate: bool = False) -> None:
+    def up(self, service: str, *, recreate: bool = False,
+           before_start: Callable[[], None] | None = None) -> None:
+        """Start an app, with optional Desktop runtime setup after dependency readiness."""
         self._service(service)
         # Validate the desired model before stopping a working old model.
-        self.write_override()
+        if before_start is None:
+            self.write_override()
+        else:
+            self._validate_mounts()
         old = self.state.read_mode()
         pending = self.state.read_pending()
+        changing_mode = old is not None and old not in (self.config.docker_mode, pending)
+        desktop_uses_inner_docker = service == 'claude-desktop' and self.config.docker_mode == 'sysbox'
+        if before_start is not None and (pending is not None or changing_mode):
+            self.write_override()
         if pending is not None:
             self._model(pending)._run('down', runtime_mounts=False)
+            if desktop_uses_inner_docker:
+                self.state.require_modes(old, pending)
             self.state.clear_pending()
-        if old is not None and old != self.config.docker_mode and old != pending:
+        if changing_mode:
             self._model(old)._run('down', runtime_mounts=False)
-        # Compose may create resources before failing on dependency health.
-        # Persist recovery information before up, without claiming success.
-        self.state.write_pending(self.config.docker_mode)
+        bootstrap_pending = None
+        if desktop_uses_inner_docker:
+            if old != self.config.docker_mode or pending is not None:
+                # A partial bootstrap needs recovery even if the app never starts.
+                self.state.require_modes(old, None)
+                bootstrap_pending = self.config.docker_mode
+                self.state.write_pending(bootstrap_pending)
+            self.ensure_inner_docker()
+            self.state.require_modes(old, bootstrap_pending)
+        if before_start is not None:
+            before_start()
+            self.write_override()
+        # Persist recovery information before the app start can create resources.
+        if bootstrap_pending is None:
+            self.state.write_pending(self.config.docker_mode)
         options = ['up', '-d', '--no-build', '--pull', 'never']
         if recreate:
             options.append('--force-recreate')
-            if old == self.config.docker_mode and pending is None:
-                options.append('--no-deps')
+        if desktop_uses_inner_docker or (recreate and old == self.config.docker_mode and pending is None):
+            options.append('--no-deps')
         try:
             self._run(*options, service)
         except subprocess.CalledProcessError:
@@ -196,6 +220,24 @@ class ComposeProject:
             raise
         self.state.write_mode(self.config.docker_mode)
         self.state.clear_pending()
+
+    def ensure_inner_docker(self) -> None:
+        """Start the Sysbox dependency and wait for health without changing app state."""
+        if self.config.docker_mode != 'sysbox':
+            return
+        try:
+            self._run('up', '-d', '--no-build', '--pull', 'never', '--no-recreate',
+                      '--no-deps', '--wait', '--wait-timeout', '120', 'inner-docker',
+                      runtime_mounts=False)
+        except subprocess.CalledProcessError:
+            print('claude-docker: inner-docker did not become ready. '
+                  'If its image is missing, run claude-docker pull first.', file=sys.stderr)
+            raise
+
+    def recreate_desktop(self) -> None:
+        """Recreate only Desktop without consuming or modifying core mode state."""
+        self._run('up', '-d', '--no-build', '--pull', 'never', '--force-recreate',
+                  '--no-deps', 'claude-desktop')
 
     def running_container_id(self, service: str, *, runtime_mounts: bool = True) -> str | None:
         self._service(service)
@@ -227,9 +269,30 @@ class ComposeProject:
     def down(self) -> None:
         self._teardown('down')
 
+    def _remove_unrecorded_inner_docker(self) -> None:
+        # First restart publishes its mode after recreating Desktop. Recover any
+        # earlier dependency start by ID, without adopting an unverified model.
+        command = ['docker', 'container', 'ls', '--all', '--quiet', '--no-trunc']
+        for label in (f'{_LABEL}managed=true', f'{_LABEL}owner-uid={self.host_uid}',
+                      f'com.docker.compose.project={self.project_name}',
+                      'com.docker.compose.service=inner-docker'):
+            command.extend(['--filter', f'label={label}'])
+        result = self.runner.run(command, env=self.environment, capture_output=True)
+        identifiers = result.stdout.splitlines()
+        if any(not re.fullmatch(r'[0-9a-f]{64}', identifier) for identifier in identifiers):
+            raise ValueError('Invalid inner-docker container ID during teardown')
+        if self.state.read_mode() is not None or self.state.read_pending() is not None:
+            raise ValueError('Docker mode or pending transition changed during teardown. '
+                             'Retry after the transition completes.')
+        if identifiers:
+            self.runner.run(['docker', 'container', 'stop', *identifiers], env=self.environment)
+            self.runner.run(['docker', 'container', 'rm', *identifiers], env=self.environment)
+
     def _teardown(self, *operation: str) -> None:
         modes = tuple(dict.fromkeys(mode for mode in (
             self.state.read_pending(), self.state.read_mode()) if mode is not None))
+        if self._teardown_only and not modes:
+            self._remove_unrecorded_inner_docker()
         for mode in modes or (self.config.docker_mode,):
             self._model(mode)._run(*operation, runtime_mounts=False)
         # Never create runtime/application directories during teardown, or follow

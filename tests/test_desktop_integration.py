@@ -28,6 +28,8 @@ from claude_docker.model import (AppConfig, ContainerConfig, DesktopConfig,
                                  EnvironmentConfig, StateMountConfig)
 from claude_docker.mounts import prepare_mounts
 from claude_docker.paths import resolve_host_paths
+from claude_docker.seccomp import resolve_desktop_seccomp
+from claude_docker.seccomp_profile import decode_profile, desktop_profile
 
 
 class DesktopIntegrationTests(unittest.TestCase):
@@ -73,6 +75,8 @@ class DesktopIntegrationTests(unittest.TestCase):
                          tempfile.mkdtemp(prefix='claude-desktop-artifacts-')).expanduser()
         artifacts.mkdir(mode=0o700, parents=True, exist_ok=True)
         report = {'build': build, 'commands': [], 'artifacts': str(artifacts.resolve())}
+        capture_app = os.environ.get('CLAUDE_DOCKER_TEST_CAPTURE_APP', '1') == '1'
+        report['capture_app'] = capture_app
         # Keep the real detached child's Popen alive until production stop.
         # This observes ownership only; start/stop and policy code stay real.
         managers = []
@@ -166,6 +170,12 @@ class DesktopIntegrationTests(unittest.TestCase):
                         self.project_name = project_name
                         self.files.insert(-1, override)
 
+                    def exec(self, service, command, **kwargs):
+                        if capture_app and command[0] == 'claude-desktop':
+                            command = ['sh', '-c', '"$@" >/tmp/diagnostic.stdout 2>/tmp/diagnostic.stderr; '
+                                       'echo $? >/tmp/diagnostic.exit', 'diagnostic', *command]
+                        return super().exec(service, command, **kwargs)
+
                     def _model(self, mode):
                         return TestProject(replace(self.config, docker_mode=mode), self.paths,
                             self.mounts, self.runner, desktop_runtime=self.desktop_runtime)
@@ -184,6 +194,27 @@ class DesktopIntegrationTests(unittest.TestCase):
                     assert config.container.home == Path(account.pw_dir)
                     assert config.container.user == account.pw_name
                     project = TestProject(config, paths, prepare_mounts(config), ObservedRunner())
+                    def collect_diagnostics():
+                        try:
+                            container = project.container_id('claude-desktop')
+                        except Exception as error:
+                            report['diagnostic_error'] = str(error)
+                            return
+                        queries = {
+                            'os_release': ['cat', '/etc/os-release'],
+                            'profile_logs': ['sh', '-c', r'find "$HOME/.config/Claude" -type f -name "*.log" -exec tail -c 16000 {} \;'],
+                        }
+                        if capture_app:
+                            for name in ('stdout', 'stderr', 'exit'):
+                                queries['app_' + name] = ['tail', '-c', '16000', '/tmp/diagnostic.' + name]
+                        for key, args in queries.items():
+                            try:
+                                result = subprocess.run(['docker', 'exec', container, *args], capture_output=True,
+                                                        text=True, errors='replace', timeout=15)
+                                report[key] = dict(stdout=result.stdout, stderr=result.stderr, status=result.returncode)
+                            except Exception as error:
+                                report[key] = dict(error=str(error))
+
                     runtime = None
                     try:
                         args = ['docker', 'build', '--target', 'desktop', '--tag', build['image']]
@@ -227,8 +258,13 @@ class DesktopIntegrationTests(unittest.TestCase):
                         assert all(m['Type'] == 'bind' for m in details['Mounts'])
                         policies = [o for o in host['SecurityOpt'] if o.startswith('seccomp=')]
                         assert len(policies) == 1
-                        assert json.loads(policies[0].split('=', 1)[1]) == json.loads(
-                            (ROOT/'security/desktop-seccomp-v0.2.4-linux-amd64.json').read_text())
+                        profile = resolve_desktop_seccomp(config, ObservedRunner(), program_dir=ROOT,
+                                                          cache_dir=paths.cache_dir, create=False)
+                        baseline = decode_profile((profile.parent / 'baseline.json').read_bytes())
+                        actual = json.loads(policies[0].split('=', 1)[1])
+                        assert actual == desktop_profile(baseline)
+                        assert len(actual['syscalls']) == len(baseline['syscalls']) + 4
+                        report['profile_provenance'] = json.loads((profile.parent / 'metadata.json').read_bytes())
                         report['mounted_sources'] = [m['Source'] for m in details['Mounts']]
                         report['identity'] = command('docker','exec',container,'sh','-ec',
                             'id -u; id -g; printf "%s\\n" "$HOME"')
@@ -268,10 +304,7 @@ class DesktopIntegrationTests(unittest.TestCase):
                         report['manual_clipboard_verified'] = True
                         report['observed_seconds'] = 20
                         report['startup_logs'] = command('docker', 'logs', container)
-                        # The app uses detached exec, so container logs may be empty.
-                        # Capture profile log files too, before sending any stop signal.
-                        report['profile_logs'] = command('docker', 'exec', container, 'sh', '-c',
-                            r'find "$HOME/.config/Claude" -type f -name "*.log" -exec tail -c 16000 {} \;', errors='replace')
+                        collect_diagnostics()
                         report['stop_result'] = cli.main(['stop'])
                         assert report['stop_result'] == 0
                         assert not project_resources('containers') and not project_resources('networks')
@@ -281,6 +314,8 @@ class DesktopIntegrationTests(unittest.TestCase):
                         assert not list((root/'x11').iterdir())
                         report['production_stop_verified_before_fallback'] = True
                     finally:
+                        if 'os_release' not in report:
+                            collect_diagnostics()
                         os.chdir(original_cwd)
                         for label, cleanup in [
                             ('desktop',lambda:desktop.stop_desktop_runtime(paths,project=project)),

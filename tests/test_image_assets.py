@@ -56,7 +56,9 @@ class ImageAssetTests(unittest.TestCase):
         self.assertIn("mise", stages)
         self.assertEqual(stages["mise"]["image"], "jdxcode/mise:2026.11.5")
         self.assertIn("common", stages)
-        self.assertEqual(stages["common"]["image"], "ubuntu:24.04")
+        self.assertEqual(stages["common"]["image"], "ubuntu:26.04")
+        common_runs = " ".join(value for op, value in stages["common"]["instructions"] if op == "RUN")
+        self.assertIn("https://download.docker.com/linux/ubuntu resolute stable", common_runs)
         mise_copies = [
             fields[1:]
             for op, value in stages["common"]["instructions"] if op == "COPY"
@@ -155,7 +157,7 @@ class ImageAssetTests(unittest.TestCase):
         common = stages["common"]["instructions"]
         stage = stages.get("claude-code")
         self.assertIsNotNone(stage, "independent Code stage is missing")
-        self.assertEqual(stage["image"], "ubuntu:24.04")
+        self.assertEqual(stage["image"], "ubuntu:26.04")
         instructions = stage["instructions"]
         pin = next(index for index, (op, value) in enumerate(instructions)
                    if op == "COPY" and value.startswith("image/claude-code.version "))

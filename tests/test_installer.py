@@ -77,7 +77,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_version_file_agrees_with_package(self):
         self.assertEqual((ROOT / "VERSION").read_text().strip(), __version__)
-        self.assertEqual(__version__, "0.3.4")
+        self.assertEqual(__version__, "0.3.7")
 
     def test_install_copies_runtime_bundle_with_verified_manifest_and_links(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
@@ -114,22 +114,16 @@ class InstallerTests(unittest.TestCase):
 
     def test_policy_bundle_is_complete_readable_and_importable(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
-        self.assertEqual(len(manifest.files), 41)
+        self.assertEqual(len(manifest.files), 43)
         installed = self.layout.release_dir(__version__)
-        policy = installed / 'security/desktop-seccomp-v0.2.4-linux-amd64.json'
-        self.assertEqual(hashlib.sha256(policy.read_bytes()).hexdigest(),
-                         'f245d64a3213793f730f394d44c507145b13ffc8d05acb21b5146413aa395a74')
         for item in manifest.files:
             if str(item.path).startswith('security/'):
                 self.assertEqual(item.mode, 0o644)
         result = subprocess.run([sys.executable, '-c',
-                                'from claude_docker.seccomp import chromium_policy_path; '
-                                'from pathlib import Path; '
-                                'print(chromium_policy_path(Path(".")))'],
+                                'from claude_docker.seccomp import resolve_desktop_seccomp'],
                                cwd=installed, env=dict(self.env, PYTHONPATH=str(installed / 'src')),
                                text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), str(policy))
 
     def test_install_preserves_project_and_third_party_licenses(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
@@ -193,12 +187,11 @@ class InstallerTests(unittest.TestCase):
             'Dockerfile', 'compose.yaml', 'compose.sysbox.yaml', 'config.example.toml',
             'image/customize.sh', 'image/customize.example.sh', 'image/mise.lock', 'image/mise.toml',
             'image/claude-code.version',
-            'security/desktop-seccomp-v0.2.4-linux-amd64.json',
             'security/LICENSE.moby-profiles', 'security/NOTICE.moby-profiles',
         } | {f'src/claude_docker/{module}.py' for module in (
             '__init__', '__main__', 'checks', 'claude_version', 'cli', 'clipboard', 'commands', 'compose',
             'config', 'customize', 'desktop', 'environment', 'installer', 'manifest', 'model',
-            'mounts', 'paths', 'process', 'seccomp', 'state', 'uninstall', 'tool_config', 'image_tools',
+            'mounts', 'paths', 'process', 'seccomp_source', 'seccomp_cache', 'seccomp_profile', 'seccomp', 'state', 'uninstall', 'tool_config', 'image_tools',
         )}
         self.assertEqual(paths, expected)
         self.assertEqual({str(path.relative_to(release)) for path in release.rglob('*')

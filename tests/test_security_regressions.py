@@ -94,7 +94,7 @@ class DesktopPolicyBoundaryTests(ComposeFixture, unittest.TestCase):
               patch.object(cli, 'resolve_host_paths', return_value=self.paths),
               patch.object(cli, 'load_config', return_value=config),
               patch.object(cli, 'CommandRunner', return_value=self.runner),
-              patch('claude_docker.seccomp.chromium_policy_path', side_effect=AssertionError('policy lookup')),
+              patch('claude_docker.seccomp_cache.resolve_cached_profile', side_effect=AssertionError('policy lookup')),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertEqual(cli.main(['claude', '--help']), 0)
         model = json.loads((self.paths.runtime_dir / 'compose.sysbox.json').read_text())

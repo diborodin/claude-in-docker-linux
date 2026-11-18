@@ -132,6 +132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                       details='Put launcher options before application arguments. Use -- to separate them.\n'
                               'The default policy enables the sandbox and uses manual clipboard transfers.\n'
                               'A running process keeps its settings and credentials until restart or stop.\n'
+                              'Sysbox mode starts inner Docker as needed and waits for it before launch or reuse.\n'
                               'Select seccomp in configuration with [desktop].seccomp or CLAUDE_DESKTOP_SECCOMP.',
                       examples=('claude-docker desktop', 'claude-docker desktop --restart',
                                 'claude-docker desktop -- --help'),

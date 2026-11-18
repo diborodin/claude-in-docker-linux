@@ -1,4 +1,6 @@
 """Feature requests add read-only Desktop prerequisites and effective policy."""
+from contextlib import redirect_stderr
+import io
 from dataclasses import replace
 import json
 import os
@@ -9,6 +11,8 @@ from unittest.mock import patch
 from tests.test_checks import Fixture, DockerRunner
 from claude_docker.checks import run_checks
 from tests.test_seccomp import SERVER, INFO
+from tests.test_seccomp_source import OfficialSources
+from claude_docker.seccomp import resolve_desktop_seccomp
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,12 +28,18 @@ class PolicyCheckRunner(DockerRunner):
 
 
 class DesktopChecksTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        cache = patch.dict(os.environ, {'XDG_CACHE_HOME': str(self.root / 'cache')})
+        cache.start()
+        self.addCleanup(cache.stop)
+
     def test_check_reports_requested_policy_without_claiming_active_policy(self):
         for policy in ('default', 'chromium'):
             config = replace(self.config, desktop=replace(self.config.desktop, seccomp=policy))
             rows = {row.name: row for row in run_checks(config, smoke=False, runner=PolicyCheckRunner(),
                                                        desktop=True, program_dir=ROOT)}
-            self.assertEqual(rows['desktop-seccomp'].status, 'ok')
+            self.assertEqual(rows['desktop-seccomp'].status, 'ok' if policy == 'default' else 'warning')
             self.assertIn('Requested policy for next Desktop start: ' + policy, rows['desktop-seccomp'].message)
             self.assertIn('not verified', rows['desktop-lifetime'].message)
             self.assertIn('container security', rows['desktop-lifetime'].message)
@@ -44,16 +54,26 @@ class DesktopChecksTests(Fixture):
                 patch('os.fchmod', side_effect=AssertionError('check fchmod')):
             rows = {row.name: row for row in run_checks(selected, smoke=False, runner=runner,
                                                        desktop=True, program_dir=ROOT)}
-        self.assertEqual(rows['desktop-seccomp'].status, 'ok')
+        self.assertEqual(rows['desktop-seccomp'].status, 'warning')
         self.assertEqual(before, {path: path.stat().st_mode for path in self.root.rglob('*')})
         self.assertTrue(all(argv[1] in ('--version', 'version', 'info', 'compose') for argv, _ in runner.calls))
         self.assertTrue(all('run' not in argv and 'up' not in argv for argv, _ in runner.calls))
 
+    def test_check_verifies_warm_cache_offline_and_reports_corruption(self):
+        selected = replace(self.config, desktop=replace(self.config.desktop, seccomp='chromium'))
+        with redirect_stderr(io.StringIO()), patch('claude_docker.seccomp_source.fetch_official', side_effect=OfficialSources()):
+            profile = resolve_desktop_seccomp(selected, PolicyCheckRunner(), program_dir=ROOT)
+        with patch('claude_docker.seccomp_source.fetch_official', side_effect=AssertionError('network')):
+            for status in ('ok', 'error'):
+                if status == 'error':
+                    profile.write_text('{}')
+                rows = {row.name: row for row in run_checks(selected, smoke=False,
+                            runner=PolicyCheckRunner(), desktop=True, program_dir=ROOT)}
+                self.assertEqual(rows['desktop-seccomp'].status, status)
+
     def test_policy_errors_are_reported_and_plain_check_does_not_resolve_policy(self):
         selected = replace(self.config, desktop=replace(self.config.desktop, seccomp='chromium'))
-        for config, flags, error in ((selected, {}, 'integrity'),
-                                     (selected, {'no_sandbox': True}, 'internal sandbox'),
-                                     (replace(selected, docker_mode='sysbox'), {}, 'docker_mode=none')):
+        for config, flags, error in ((selected, {'no_sandbox': True}, 'internal sandbox'),):
             rows = {row.name: row for row in run_checks(config, smoke=False, runner=PolicyCheckRunner(),
                                                        desktop=True, program_dir=self.root, **flags)}
             self.assertEqual(rows['desktop-seccomp'].status, 'error')

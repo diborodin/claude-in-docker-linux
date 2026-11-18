@@ -34,7 +34,7 @@ mount = true # false disables this mount.
 [desktop]
 sandbox = true # false explicitly requests Chromium --no-sandbox.
 clipboard = "manual" # "bidirectional" opts into background synchronization.
-seccomp = "default" # "chromium" explicitly enables the bundled namespace policy.
+seccomp = "default" # "chromium" explicitly enables the daemon-derived namespace policy.
 
 [environment]
 # These lists contain exact variable NAMES only, never credential values.

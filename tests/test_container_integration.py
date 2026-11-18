@@ -21,6 +21,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from claude_docker import cli
 from claude_docker.commands import CommandRunner
 from claude_docker.compose import ComposeProject
+from claude_docker.config import AccountInfo, load_config
+from claude_docker.paths import HostPaths
 
 
 IDENTITY = {
@@ -392,6 +394,89 @@ optional = ["RELEASE_SMOKE_EMPTY", "RELEASE_SMOKE_ABSENT"]
                                          f"label=com.docker.compose.project={project_name}",
                                          timeout=20), "")
         self.assertFalse(root.exists())
+
+    def test_inner_docker_readiness_starts_or_reuses_only_the_dependency(self):
+        image = "docker:29-dind"
+        if not self.command("docker", "image", "ls", "-q", "--filter", f"reference={image}"):
+            self.skipTest(f"local {image} image is required for the disposable sleep services")
+
+        with tempfile.TemporaryDirectory(prefix="claude-inner-readiness-") as temporary:
+            root = Path(temporary)
+            paths = HostPaths(root / "home", root / "config", root / "data", root / "state",
+                              root / "cache", root / "runtime")
+            config = load_config(env={}, paths=paths,
+                                 account=AccountInfo("tester", 10000, 10000, paths.home))
+            runner = CommandRunner()
+            disabled = ComposeProject(config, paths, (), runner, program_dir=root)
+            with patch.object(runner, "run", side_effect=AssertionError("none mode invoked Docker")):
+                disabled.ensure_inner_docker()
+
+            project = ComposeProject(replace(config, docker_mode="sysbox"), paths, (), runner,
+                                     program_dir=root)
+            project.project_name = "claude-inner-readiness-" + self.token
+            keeper = {"image": image, "runtime": "runc", "network_mode": "none",
+                      "entrypoint": ["sleep", "infinity"], "tmpfs": ["/var/lib/docker"]}
+            (root / "compose.yaml").write_text(json.dumps({"services": {
+                "claude-cli": keeper,
+                "claude-desktop": {**keeper, "profiles": ["desktop"]},
+            }}))
+
+            def write_overlay(revision):
+                dependency = {"depends_on": {"inner-docker": {"condition": "service_healthy"}}}
+                (root / "compose.sysbox.yaml").write_text(json.dumps({"services": {
+                    "claude-cli": dependency,
+                    "claude-desktop": dependency,
+                    "inner-docker": {**keeper, "environment": {"TEST_REVISION": revision},
+                                     "healthcheck": {"test": ["CMD", "true"],
+                                                     "interval": "1s", "timeout": "1s", "retries": 3}},
+                }}))
+
+            def compose(*args):
+                return self.command(*project.command(*args, runtime_mounts=False),
+                                    env=project.environment)
+
+            def inspect(service):
+                identifier = compose("ps", "--all", "-q", service)
+                return json.loads(self.command("docker", "inspect", identifier,
+                                               env=project.environment))[0]
+
+            def lifetime(details):
+                return details["Id"], details["State"]["StartedAt"], details["RestartCount"]
+
+            write_overlay("initial")
+            try:
+                compose("up", "-d", "--no-build", "--pull", "never", "--no-deps",
+                        "claude-cli", "claude-desktop")
+                keepers = ("claude-cli", "claude-desktop")
+                original_keepers = [lifetime(inspect(service)) for service in keepers]
+                self.assertEqual(compose("ps", "--all", "-q", "inner-docker"), "")
+
+                project.ensure_inner_docker()
+                initial = inspect("inner-docker")
+                self.assertEqual(initial["State"]["Health"]["Status"], "healthy")
+                self.assertEqual([lifetime(inspect(service)) for service in keepers], original_keepers)
+
+                compose("stop", "--timeout", "2", "inner-docker")
+                self.assertFalse(inspect("inner-docker")["State"]["Running"])
+                # A changed configuration would otherwise cause Compose to replace it.
+                write_overlay("changed")
+                project.ensure_inner_docker()
+                restarted = inspect("inner-docker")
+                self.assertEqual(restarted["Id"], initial["Id"])
+                self.assertNotEqual(restarted["State"]["StartedAt"], initial["State"]["StartedAt"])
+                self.assertEqual(restarted["State"]["Health"]["Status"], "healthy")
+                self.assertEqual([lifetime(inspect(service)) for service in keepers], original_keepers)
+
+                project.ensure_inner_docker()
+                self.assertEqual(lifetime(inspect("inner-docker")), lifetime(restarted))
+                self.assertEqual([lifetime(inspect(service)) for service in keepers], original_keepers)
+                self.assertFalse(paths.runtime_dir.exists())
+                self.assertFalse(paths.state_dir.exists())
+            finally:
+                compose("down", "--volumes", "--timeout", "2")
+            self.assertEqual(self.command("docker", "ps", "-aq", "--filter",
+                                          f"label=com.docker.compose.project={project.project_name}",
+                                          env=project.environment), "")
 
     def test_sysbox_inner_docker(self):
         # Catch a daemon health/TLS/client mount regression with a real nested run.

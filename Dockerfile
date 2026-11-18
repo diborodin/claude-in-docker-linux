@@ -1,6 +1,6 @@
 FROM jdxcode/mise:2026.11.5 AS mise
 
-FROM ubuntu:24.04 AS claude-code
+FROM ubuntu:26.04 AS claude-code
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl jq \
@@ -43,7 +43,7 @@ RUN set -eu; \
     chmod 0555 /out/claude; \
     rm /tmp/claude-code.version /tmp/claude-code-manifest.json
 
-FROM ubuntu:24.04 AS common
+FROM ubuntu:26.04 AS common
 
 ARG CLAUDE_USER=claude
 ARG CLAUDE_UID=1000
@@ -63,7 +63,7 @@ RUN apt-get update \
  && install -m 0755 -d /etc/apt/keyrings \
  && curl -fsSLo /etc/apt/keyrings/docker.asc https://download.docker.com/linux/ubuntu/gpg \
  && chmod a+r /etc/apt/keyrings/docker.asc \
- && printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable\n' \
+ && printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu resolute stable\n' \
       "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.list \
  && apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \

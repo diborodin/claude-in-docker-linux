@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from tests.test_compose import ComposeFixture, ROOT
 from tests.test_seccomp import SERVER, INFO
-from claude_docker.seccomp import POLICY_RELATIVE_PATH
+from tests.test_seccomp_source import OfficialSources, PROFILE_URL, REF_API, SOURCE_COMMIT, ref_json
 from claude_docker import cli, desktop
 from claude_docker.model import DesktopRuntime, ProcessIdentity
 
@@ -19,12 +19,14 @@ from claude_docker.model import DesktopRuntime, ProcessIdentity
 class DesktopRunner:
     def __init__(self):
         self.calls = []
+        self.container_running = False
         self.running = False
         self.app_exit = 0
         self.openbox_exit = 0
         self.disappear = False
         self.socket_exit = 0
         self.pgrep_exit = None
+        self.security_options = None
         self.server = dict(SERVER)
         self.info = dict(INFO)
 
@@ -36,7 +38,11 @@ class DesktopRunner:
             output = json.dumps(self.server)
         if argv[1:] == ['info', '--format', '{{json .}}']:
             output = json.dumps(self.info)
-        if 'ps' in argv:
+        if argv[1] == 'inspect':
+            output = json.dumps(self.security_options)
+        if 'up' in argv and argv[-1] == 'claude-desktop':
+            self.container_running = True
+        if 'ps' in argv and (self.container_running or self.running):
             output = 'desktop-one\n'
         if 'pgrep' in argv:
             code = self.pgrep_exit if self.pgrep_exit is not None else (0 if self.running else 1)
@@ -70,7 +76,11 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         patch.object(desktop.XephyrManager, 'load', return_value=None, create=True).start()
         patch.object(desktop.XephyrManager, 'start', side_effect=lambda: self.events.append('start') or self.runtime).start()
         patch.object(desktop.XephyrManager, 'stop', side_effect=lambda runtime: self.events.append('stop')).start()
+        patch.object(desktop.XephyrManager, 'stop_recorded', side_effect=lambda **kwargs: self.events.append('stop')).start()
         patch.object(desktop.time, 'sleep').start()
+        patch('claude_docker.seccomp.resolve_host_paths', return_value=self.paths).start()
+        self.sources = OfficialSources()
+        patch('claude_docker.seccomp_source.fetch_official', side_effect=self.sources).start()
         self.stdout, self.stderr = io.StringIO(), io.StringIO()
 
     def launch(self, config=None, **flags):
@@ -86,11 +96,11 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
     def chromium_config(self):
         return replace(self.config, desktop=replace(self.config.desktop, seccomp='chromium'))
 
-    def test_opt_in_launch_applies_packaged_profile_and_warns(self):
+    def test_opt_in_launch_applies_cached_profile_and_warns(self):
         self.assertEqual(self.launch(self.chromium_config()), 0)
         services = json.loads((self.paths.runtime_dir / 'compose.none.json').read_text())['services']
         self.assertEqual(services['claude-desktop']['security_opt'],
-                         ['seccomp=' + str(ROOT / POLICY_RELATIVE_PATH)])
+                         ['seccomp=' + str(next(self.paths.cache_dir.rglob('desktop.json')))])
         self.assertNotIn('security_opt', services['claude-cli'])
         self.assertNotIn('--no-sandbox', self.app_commands()[0])
         warning = self.stderr.getvalue()
@@ -102,19 +112,10 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         # Real resolver errors must precede mount preparation and runtime mkdir.
         self.runtime.xauthority.unlink()
         self.paths.runtime_dir.rmdir()
-        missing = self.root / 'program'
-        (missing / 'src/claude_docker').mkdir(parents=True)
-        (missing / 'src/claude_docker/cli.py').touch()
-        corrupt = self.root / 'corrupt-program'
-        (corrupt / 'src/claude_docker').mkdir(parents=True)
-        (corrupt / 'src/claude_docker/cli.py').touch()
-        (corrupt / POLICY_RELATIVE_PATH).parent.mkdir()
-        (corrupt / POLICY_RELATIVE_PATH).write_text('corrupted policy')
-        for program, server in ((ROOT, dict(SERVER, Version='29.9.3')),
-                                (missing, SERVER), (corrupt, SERVER)):
+        for server in (dict(SERVER, Version='29.9.3'), dict(SERVER, Arch='arm64')):
             self.runner.server = server
             self.runner.calls.clear()
-            with self.subTest(program=program), patch.dict(os.environ, {'CLAUDE_DOCKER_DIR': str(program)}), \
+            with self.subTest(server=server), \
                     patch.object(desktop, 'prepare_mounts', side_effect=AssertionError('mount mutation')):
                 with self.assertRaisesRegex(ValueError, 'seccomp policy'):
                     self.launch(self.chromium_config(), restart=True)
@@ -145,13 +146,15 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         patch.object(desktop.XephyrManager, 'load', return_value=self.runtime).start()
         self.runner.running = True
         selected = self.chromium_config()
-        self.assertEqual(self.launch(selected), 0)
+        with self.assertRaisesRegex(ValueError, '--restart'):
+            self.launch(selected)
         self.assertEqual(self.events, [])
         self.assertFalse(any('up' in argv for argv, _ in self.runner.calls))
         self.assertFalse((self.paths.runtime_dir / 'compose.none.json').exists())
-        self.assertIn('container security', self.stdout.getvalue())
-        self.assertIn('persist until restart or stop', self.stdout.getvalue())
-        self.assertEqual(self.stderr.getvalue(), '')
+        policy = next(self.paths.cache_dir.rglob('desktop.json'))
+        self.runner.security_options = ['seccomp=' + policy.read_text()]
+        self.assertEqual(self.launch(selected), 0)
+        self.assertIn('already running', self.stdout.getvalue())
         self.runner.calls.clear()
         self.assertEqual(self.launch(selected, restart=True), 0)
         self.assertEqual(self.events, ['stop', 'start'])
@@ -163,7 +166,38 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         self.assertFalse(any('down' in argv or 'claude-cli' in argv or 'inner-docker' in argv for argv in commands))
         services = json.loads((self.paths.runtime_dir / 'compose.none.json').read_text())['services']
         self.assertEqual(services['claude-desktop']['security_opt'],
-                         ['seccomp=' + str(ROOT / POLICY_RELATIVE_PATH)])
+                         ['seccomp=' + str(next(self.paths.cache_dir.rglob('desktop.json')))])
+
+    def test_docker_update_keeps_running_policy_until_restart(self):
+        selected = self.chromium_config()
+        self.launch(selected)
+        old = next(self.paths.cache_dir.rglob('desktop.json'))
+        self.runner.security_options = ['seccomp=' + old.read_text()]
+        self.runner.calls.clear()
+        self.runner.server['Version'] = self.runner.info['ServerVersion'] = '29.10.1'
+        self.sources.responses[REF_API + 'docker-v29.10.1'] = ref_json('docker-v29.10.1', SOURCE_COMMIT)
+        self.sources.responses[PROFILE_URL] = self.sources.responses[PROFILE_URL].replace(b'read', b'write')
+        with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime):
+            with self.assertRaisesRegex(ValueError, '--restart'):
+                self.launch(selected)
+        self.assertEqual(len(list(self.paths.cache_dir.rglob('desktop.json'))), 2)
+        self.assertFalse(any('up' in argv or 'down' in argv for argv, _ in self.runner.calls))
+
+    def test_policy_change_requires_restart_after_app_exits(self):
+        self.runner.container_running = True
+        self.runner.pgrep_exit = 1
+        self.runner.security_options = ['seccomp={"defaultAction":"SCMP_ACT_ERRNO"}']
+        with self.assertRaisesRegex(ValueError, '--restart'):
+            self.launch()
+        self.assertFalse(any('up' in argv for argv, _ in self.runner.calls))
+
+    def test_running_policy_change_requires_restart_even_without_display_record(self):
+        self.runner.running = True
+        self.runner.security_options = ['seccomp={"defaultAction":"SCMP_ACT_ERRNO"}']
+        with self.assertRaisesRegex(ValueError, '--restart'):
+            self.launch()
+        self.assertEqual(self.events, [])
+        self.assertFalse(any('up' in argv for argv, _ in self.runner.calls))
 
     def test_default_starts_only_desktop_then_detached_openbox_and_sandboxed_app(self):
         self.assertEqual(self.launch(app_args=('--help', 'literal; $(false)')), 0)
@@ -250,6 +284,144 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         self.assertEqual(pgrep[0][-3:], ['pgrep', '-x', 'claude-desktop'])
         self.assertFalse(any('up' in argv for argv, _ in self.runner.calls))
 
+    def test_sysbox_reuse_ensures_inner_docker_before_clipboard_sync(self):
+        from claude_docker.clipboard import ClipboardSync
+
+        config = replace(self.config, docker_mode='sysbox')
+        self.project(config=config).state.write_mode('sysbox')
+        self.runner.running = True
+
+        def start_sync(runtime, *, host_display):
+            self.assertEqual(runtime, self.runtime)
+            self.assertEqual(host_display, ':0')
+            self.assertEqual([argv[-1] for argv, _ in self.runner.calls if 'up' in argv],
+                             ['inner-docker'])
+
+        with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime), \
+                patch.object(ClipboardSync, 'start', side_effect=start_sync) as start:
+            self.assertEqual(self.launch(config, clipboard_sync=True), 0)
+        start.assert_called_once()
+        self.assertIn('already running', self.stdout.getvalue())
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.app_commands(), [])
+        self.assertFalse(any('stop' in argv or 'down' in argv for argv, _ in self.runner.calls))
+
+    def test_sysbox_start_targets_desktop_without_implicitly_recreating_inner_docker(self):
+        config = replace(self.config, docker_mode='sysbox')
+        state = self.project(config=config).state
+        state.write_mode('sysbox')
+        self.assertEqual(self.launch(config), 0)
+        ups = [argv for argv, _ in self.runner.calls if 'up' in argv]
+        self.assertEqual([argv[-1] for argv in ups], ['inner-docker', 'claude-desktop'])
+        self.assertIn('--no-recreate', ups[0])
+        self.assertIn('--wait', ups[0])
+        self.assertIn('--no-deps', ups[1])
+        self.assertNotIn('--force-recreate', ups[1])
+        self.assertEqual(state.read_mode(), 'sysbox')
+        self.assertIsNone(state.read_pending())
+
+    def test_sysbox_dependency_failure_blocks_start_or_reuse_without_mode_writes(self):
+        from claude_docker.clipboard import ClipboardSync
+
+        config = replace(self.config, docker_mode='sysbox')
+        state = self.project(config=config).state
+        state.write_mode('sysbox')
+        mode = state.path.read_bytes(), state.path.stat().st_ino
+        original = self.runner.run
+
+        def run(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if 'up' in argv and argv[-1] == 'inner-docker':
+                raise subprocess.CalledProcessError(7, argv)
+            return result
+
+        with patch.object(self.runner, 'run', side_effect=run), \
+                patch.object(ClipboardSync, 'start') as sync, \
+                patch.object(ClipboardSync, 'stop_recorded') as stop_sync:
+            for reuse in (False, True):
+                with self.subTest(reuse=reuse), patch.object(
+                        desktop.XephyrManager, 'load', return_value=self.runtime if reuse else None):
+                    self.runner.calls.clear()
+                    self.runner.container_running = self.runner.running = reuse
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        self.launch(config, clipboard_sync=True)
+                    self.assertEqual(self.events, [])
+                    self.assertEqual(self.app_commands(), [])
+                    self.assertEqual(self.runner.container_running, reuse)
+                    changes = [argv[-1] for argv, _ in self.runner.calls
+                               if any(operation in argv for operation in ('up', 'down', 'stop'))]
+                    self.assertEqual(changes, ['inner-docker'])
+                    self.assertEqual((state.path.read_bytes(), state.path.stat().st_ino), mode)
+                    self.assertIsNone(state.read_pending())
+        sync.assert_not_called()
+        stop_sync.assert_not_called()
+        self.assertNotIn('already running', self.stdout.getvalue())
+
+    def test_sysbox_policy_mismatch_rejects_reuse_before_dependency_start(self):
+        config = replace(self.config, docker_mode='sysbox')
+        self.project(config=config).state.write_mode('sysbox')
+        self.runner.running = True
+        self.runner.security_options = ['seccomp={"defaultAction":"SCMP_ACT_ERRNO"}']
+
+        with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime):
+            with self.assertRaisesRegex(ValueError, '--restart'):
+                self.launch(config)
+        self.assertEqual(self.events, [])
+        self.assertFalse(any('up' in argv for argv, _ in self.runner.calls))
+
+    def test_sysbox_invalid_mode_record_rejects_launch_before_dependency_start(self):
+        config = replace(self.config, docker_mode='sysbox')
+        state = self.project(config=config).state
+        state.write_mode('sysbox')
+        state.path.write_text('invalid\n')
+
+        for restart in (False, True):
+            with self.subTest(restart=restart), self.assertRaisesRegex(ValueError, 'Runtime mode'):
+                self.launch(config, restart=restart)
+        self.assertEqual(self.events, [])
+        self.assertFalse(any('up' in argv or 'stop' in argv for argv, _ in self.runner.calls))
+        self.assertEqual(state.path.read_text(), 'invalid\n')
+        self.assertIsNone(state.read_pending())
+
+    def test_sysbox_launch_paths_abort_if_mode_changes_while_waiting_for_inner_docker(self):
+        from claude_docker.clipboard import ClipboardSync
+
+        config = replace(self.config, docker_mode='sysbox')
+        state = self.project(config=config).state
+        original = self.runner.run
+
+        for action in ('start', 'restart', 'reuse'):
+            for changed_record in ('mode', 'pending'):
+                with self.subTest(action=action, changed_record=changed_record):
+                    state.write_mode('sysbox')
+                    state.clear_pending()
+                    self.runner.calls.clear()
+                    self.runner.container_running = self.runner.running = action != 'start'
+                    self.events.clear()
+
+                    def run(argv, **kwargs):
+                        if 'up' in argv and argv[-1] == 'inner-docker':
+                            writer = state.write_mode if changed_record == 'mode' else state.write_pending
+                            writer('none')
+                        return original(argv, **kwargs)
+
+                    with patch.object(self.runner, 'run', side_effect=run), \
+                            patch.object(ClipboardSync, 'start') as start_sync, \
+                            patch.object(ClipboardSync, 'stop_recorded') as stop_sync, \
+                            patch.object(desktop.XephyrManager, 'load',
+                                         return_value=self.runtime if action == 'reuse' else None):
+                        with self.assertRaisesRegex(ValueError, 'mode.*changed'):
+                            self.launch(config, restart=action == 'restart', clipboard_sync=True)
+                    start_sync.assert_not_called()
+                    stop_sync.assert_not_called()
+                    self.assertEqual(self.events, [])
+                    self.assertEqual(self.app_commands(), [])
+                    changes = [argv[-1] for argv, _ in self.runner.calls
+                               if any(operation in argv for operation in ('up', 'down', 'stop'))]
+                    self.assertEqual(changes, ['inner-docker'])
+                    self.assertEqual(state.read_mode(), 'none' if changed_record == 'mode' else 'sysbox')
+                    self.assertEqual(state.read_pending(), 'none' if changed_record == 'pending' else None)
+
     def test_default_checks_after_per_run_overrides_only_report_requested_policy(self):
         from claude_docker.checks import run_checks
         from claude_docker.clipboard import ClipboardSync
@@ -275,10 +447,13 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
                 project.state.write_mode(active)
                 self.assertEqual(self.launch(config), 0)
                 commands = [argv for argv, _ in self.runner.calls]
-                self.assertEqual(sum('down' in argv for argv in commands), 1)
-                self.assertEqual(sum('up' in argv for argv in commands), 1)
-                self.assertLess(next(i for i, argv in enumerate(commands) if 'down' in argv),
-                                next(i for i, argv in enumerate(commands) if 'up' in argv))
+                lifecycle = [argv for argv in commands if 'down' in argv or 'up' in argv]
+                self.assertEqual([argv[-1] for argv in lifecycle],
+                                 ['down', 'inner-docker', 'claude-desktop'] if desired == 'sysbox'
+                                 else ['down', 'claude-desktop'])
+                if desired == 'sysbox':
+                    self.assertIn('--no-recreate', lifecycle[1])
+                    self.assertIn('--no-deps', lifecycle[2])
                 self.assertEqual(len(self.app_commands()), 1)
                 self.assertEqual(project.state.read_mode(), desired)
                 self.assertIsNone(project.state.read_pending())
@@ -323,21 +498,195 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         self.assertIn('ROTATED', self.app_commands()[0])
         self.assertNotIn('SECRET', self.app_commands()[0])
 
-    def test_restart_mode_transition_retains_core_recovery_and_starts_dependencies(self):
+    def test_restart_rejects_mode_transition_without_stopping_services(self):
         self.project().state.write_mode('none')
         config = replace(self.config, docker_mode='sysbox')
-        self.assertEqual(self.launch(config, restart=True), 0)
+        with self.assertRaisesRegex(ValueError, 'mode'):
+            self.launch(config, restart=True)
         commands = [argv for argv, _ in self.runner.calls]
-        downs = [argv for argv in commands if 'down' in argv]
-        self.assertEqual(len(downs), 1)
-        self.assertNotIn(str(self.paths.runtime_dir / 'compose.none.json'), downs[0])
-        up = next(argv for argv in commands if 'up' in argv)
-        self.assertIn('--force-recreate', up)
-        self.assertNotIn('--no-deps', up)
-        self.assertIn('compose.sysbox.yaml', ' '.join(up))
-        project = self.project(config=config)
-        self.assertEqual(project.state.read_mode(), 'sysbox')
-        self.assertIsNone(project.state.read_pending())
+        self.assertFalse(any('down' in argv or 'stop' in argv or 'up' in argv for argv in commands))
+        self.assertEqual(self.project().state.read_mode(), 'none')
+        self.assertEqual(self.events, [])
+
+    def test_restart_cleans_record_without_loading_stale_runtime_in_both_modes(self):
+        from claude_docker.clipboard import ClipboardSync
+
+        for mode in ('none', 'sysbox'):
+            with self.subTest(mode=mode):
+                self.events.clear()
+                self.runner.calls.clear()
+                config = replace(self.config, docker_mode=mode)
+                self.project(config=config).state.write_mode(mode)
+                dependency_targets = ['inner-docker'] if mode == 'sysbox' else []
+
+                def stop_sync():
+                    self.assertEqual([argv[-1] for argv, _ in self.runner.calls], dependency_targets)
+                    self.assertEqual(self.events, [])
+
+                with patch.object(desktop.XephyrManager, 'load', side_effect=ValueError('stale')) as load, \
+                        patch.object(ClipboardSync, 'stop_recorded', side_effect=stop_sync) as stop:
+                    self.assertEqual(self.launch(config, restart=True), 0)
+                load.assert_not_called()
+                stop.assert_called_once()
+                self.assertEqual(self.events, ['stop', 'start'])
+                commands = [argv for argv, _ in self.runner.calls]
+                ups = [argv for argv in commands if 'up' in argv]
+                self.assertEqual([argv[-1] for argv in ups], dependency_targets + ['claude-desktop'])
+                self.assertIn('--no-deps', ups[-1])
+                self.assertIn('--force-recreate', ups[-1])
+                self.assertFalse(any('down' in argv or 'claude-cli' in argv for argv in commands))
+
+    def test_restart_rejects_pending_modes_without_cleanup(self):
+        for old, pending, desired in (('none', 'none', 'none'), ('sysbox', 'sysbox', 'sysbox')):
+            with self.subTest(old=old, pending=pending, desired=desired):
+                state = self.project().state
+                state.clear_mode()
+                state.clear_pending()
+                if old is not None:
+                    state.write_mode(old)
+                if pending is not None:
+                    state.write_pending(pending)
+                self.runner.calls.clear()
+                config = replace(self.config, docker_mode=desired)
+                with self.assertRaisesRegex(ValueError, 'mode'):
+                    self.launch(config, restart=True)
+                self.assertFalse(any('down' in argv or 'stop' in argv or 'up' in argv
+                                     for argv, _ in self.runner.calls))
+                self.assertEqual(self.events, [])
+
+    def test_restart_establishes_missing_mode_then_normal_launch_reuses_desktop(self):
+        for mode in ('none', 'sysbox'):
+            with self.subTest(mode=mode):
+                state = self.project().state
+                state.clear_mode()
+                config = replace(self.config, docker_mode=mode)
+                self.assertEqual(self.launch(config, restart=True), 0)
+                self.assertEqual(state.read_mode(), mode)
+                self.assertIsNone(state.read_pending())
+                self.runner.calls.clear()
+                with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime):
+                    self.assertEqual(self.launch(config), 0)
+                self.assertEqual(self.app_commands(), [])
+                self.assertEqual([argv[-1] for argv, _ in self.runner.calls if 'up' in argv],
+                                 ['inner-docker'] if mode == 'sysbox' else [])
+
+    def test_config_free_stop_recovers_inner_docker_after_failed_first_sysbox_restart(self):
+        config = replace(self.config, docker_mode='sysbox')
+        state = self.project(config=config).state
+        labels = {
+            'io.github.diborodin.claude-in-docker-linux.managed': 'true',
+            'io.github.diborodin.claude-in-docker-linux.owner-uid': str(os.getuid()),
+            'com.docker.compose.project': f'claude-docker-{os.getuid()}',
+            'com.docker.compose.service': 'inner-docker',
+        }
+        foreign = {
+            'b' * 64: {**labels, 'io.github.diborodin.claude-in-docker-linux.managed': 'false'},
+            'c' * 64: {**labels, 'io.github.diborodin.claude-in-docker-linux.owner-uid': str(os.getuid() + 1)},
+            'd' * 64: {**labels, 'com.docker.compose.project': 'other-project'},
+            'e' * 64: {**labels, 'com.docker.compose.service': 'other-service'},
+        }
+        inner = 'a' * 64
+        original_run = self.runner.run
+
+        for failure in ('inner-docker', 'claude-desktop'):
+            with self.subTest(failure=failure):
+                containers = foreign.copy()
+                stopped = []
+
+                def run(argv, **kwargs):
+                    argv = list(argv)
+                    self.assertEqual(kwargs['env']['DOCKER_HOST'], 'ssh://selected')
+                    self.assertNotIn('SECRET', kwargs['env'])
+                    result = original_run(argv, **kwargs)
+                    if 'up' in argv:
+                        if argv[-1] == 'inner-docker':
+                            containers[inner] = labels
+                        if argv[-1] == failure:
+                            raise subprocess.CalledProcessError(7, argv)
+                    if argv[:3] == ['docker', 'container', 'ls']:
+                        self.assertTrue({'--all', '--quiet', '--no-trunc'}.issubset(argv))
+                        filters = dict(argv[i + 1].removeprefix('label=').split('=', 1)
+                                       for i, arg in enumerate(argv) if arg == '--filter')
+                        result.stdout = '\n'.join(identifier for identifier, actual in containers.items()
+                                                 if all(actual.get(key) == value
+                                                        for key, value in filters.items()))
+                    if argv[:3] == ['docker', 'container', 'stop']:
+                        stopped.extend(argv[3:])
+                    if argv[:3] == ['docker', 'container', 'rm']:
+                        for identifier in argv[3:]:
+                            del containers[identifier]
+                    return result
+
+                with (patch.dict(os.environ, {'DOCKER_HOST': 'ssh://selected'}),
+                      patch.object(self.runner, 'run', side_effect=run),
+                      patch.object(cli, 'resolve_host_paths', return_value=self.paths),
+                      patch.object(cli, 'CommandRunner', return_value=self.runner),
+                      patch.object(cli, 'load_config', side_effect=ValueError('invalid configuration')),
+                      redirect_stderr(self.stderr)):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        self.launch(config, restart=True)
+                    self.assertIn(inner, containers)
+                    self.assertIsNone(state.read_mode())
+                    self.assertIsNone(state.read_pending())
+
+                    self.assertEqual(cli.main(['stop']), 1)  # The config error remains visible.
+
+                self.assertEqual(containers, foreign)
+                self.assertEqual(stopped, [inner])
+                self.assertNotIn('Docker Compose teardown failed', self.stderr.getvalue())
+
+    def test_first_restart_preserves_mode_published_concurrently(self):
+        state = self.project().state
+        original = self.runner.run
+
+        def run(argv, **kwargs):
+            if 'up' in argv:
+                state.write_mode('sysbox')
+            return original(argv, **kwargs)
+
+        with patch.object(self.runner, 'run', side_effect=run):
+            self.assertEqual(self.launch(restart=True), 0)
+        self.assertEqual(state.read_mode(), 'sysbox')
+        self.assertIsNone(state.read_pending())
+
+    def test_restart_does_not_consume_concurrent_core_transition(self):
+        config = replace(self.config, docker_mode='sysbox')
+        state = self.project(config=config).state
+        state.write_mode('sysbox')
+        original = self.runner.run
+
+        def run(argv, **kwargs):
+            if argv[-2:] == ['stop', 'claude-desktop']:
+                state.write_pending('none')
+            return original(argv, **kwargs)
+
+        with patch.object(self.runner, 'run', side_effect=run):
+            self.assertEqual(self.launch(config, restart=True), 0)
+        self.assertEqual(state.read_mode(), 'sysbox')
+        self.assertEqual(state.read_pending(), 'none')
+        commands = [argv for argv, _ in self.runner.calls]
+        self.assertFalse(any('down' in argv for argv in commands))
+        ups = [argv for argv in commands if 'up' in argv]
+        self.assertEqual([argv[-1] for argv in ups], ['inner-docker', 'claude-desktop'])
+        self.assertIn('--no-deps', ups[1])
+        self.assertIn('--force-recreate', ups[1])
+
+    def test_failed_restart_does_not_poison_core_mode_state(self):
+        state = self.project().state
+        state.write_mode('none')
+        original = self.runner.run
+
+        def run(argv, **kwargs):
+            if 'up' in argv:
+                raise subprocess.CalledProcessError(7, argv)
+            return original(argv, **kwargs)
+
+        with patch.object(self.runner, 'run', side_effect=run):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.launch(restart=True)
+        self.assertEqual(state.read_mode(), 'none')
+        self.assertIsNone(state.read_pending())
+        self.assertFalse(any('down' in argv for argv, _ in self.runner.calls))
 
     def test_generated_commands_and_override_do_not_expand_privileges_or_leak_secrets(self):
         self.assertEqual(self.launch(), 0)
@@ -389,6 +738,8 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
 
     def test_process_probe_error_is_not_treated_as_no_instance(self):
         patch.object(desktop.XephyrManager, 'load', return_value=self.runtime).start()
+        self.project().state.write_mode('none')
+        self.runner.container_running = True
         self.runner.pgrep_exit = 2
         with self.assertRaisesRegex(ValueError, 'process'):
             self.launch()

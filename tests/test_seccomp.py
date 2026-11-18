@@ -1,11 +1,10 @@
-"""Pinned Desktop policy permissions and selected-daemon compatibility."""
+"""Selected outer daemon identity and dynamic Desktop policy resolution."""
 
-from copy import deepcopy
+from unittest.mock import patch
 from dataclasses import replace
-import hashlib
+import os
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,13 +15,12 @@ sys.path.insert(0, str(ROOT / 'src'))
 from claude_docker.config import AccountInfo, load_config
 from claude_docker.model import DesktopConfig
 from claude_docker.paths import HostPaths
-from claude_docker.seccomp import (POLICY_RELATIVE_PATH, chromium_policy_path,
-                                  resolve_desktop_seccomp, validate_chromium_daemon)
+from claude_docker.seccomp import (resolve_desktop_seccomp, validate_chromium_daemon)
 
 
-SERVER = {'Platform': {'Name': 'Docker Engine - Community'}, 'Version': '29.9.2',
-          'Os': 'linux', 'Arch': 'amd64'}
-INFO = {'ServerVersion': '29.9.2', 'OSType': 'linux', 'Architecture': 'x86_64',
+SERVER = {'Platform': {'Name': 'Docker Engine - Community'}, 'Version': '29.10.0',
+          'GitCommit': '06db173', 'Os': 'linux', 'Arch': 'amd64'}
+INFO = {'ServerVersion': '29.10.0', 'OSType': 'linux', 'Architecture': 'x86_64',
         'SecurityOptions': ['name=seccomp,profile=builtin', 'name=apparmor']}
 
 
@@ -56,60 +54,21 @@ class SeccompTests(unittest.TestCase):
         self.assertIsNone(resolve_desktop_seccomp(self.config, runner, program_dir=self.root / 'missing'))
         self.assertEqual(runner.calls, [])
 
-    def test_policy_preserves_verified_baseline_and_only_four_exact_rules(self):
-        contents = (ROOT / POLICY_RELATIVE_PATH).read_bytes()
-        self.assertEqual(hashlib.sha256(contents).hexdigest(),
-                         'f245d64a3213793f730f394d44c507145b13ffc8d05acb21b5146413aa395a74')
-        policy = json.loads(contents)
-        expected = [
-            {'names': ['clone'], 'action': 'SCMP_ACT_ALLOW', 'args': [{'index': 0, 'value': 268435473, 'op': 'SCMP_CMP_EQ'}]},
-            {'names': ['unshare'], 'action': 'SCMP_ACT_ALLOW', 'args': [{'index': 0, 'value': 268435456, 'op': 'SCMP_CMP_EQ'}]},
-            {'names': ['clone'], 'action': 'SCMP_ACT_ALLOW', 'args': [{'index': 0, 'value': 1879048209, 'op': 'SCMP_CMP_EQ'}]},
-            {'names': ['clone'], 'action': 'SCMP_ACT_ALLOW', 'args': [{'index': 0, 'value': 536870929, 'op': 'SCMP_CMP_EQ'}]},
-        ]
-        self.assertEqual(policy['syscalls'][-4:], expected)
-        base = deepcopy(policy)
-        del base['syscalls'][-4:]
-        self.assertEqual({key: value for key, value in policy.items() if key != 'syscalls'},
-                         {key: value for key, value in base.items() if key != 'syscalls'})
-        semantic = json.dumps(base, sort_keys=True, separators=(',', ':')).encode()
-        self.assertEqual(hashlib.sha256(semantic).hexdigest(),
-                         '20ef2b6bfd980e7dd56a971d9ec0d71bc0f2d1184415f2d968a19bbcff9ee2b2')
-
-    def test_policy_integrity_and_file_type_are_checked(self):
-        policy = self.root / POLICY_RELATIVE_PATH
-        policy.parent.mkdir()
-        for kind in ('missing', 'corrupt', 'directory', 'symlink'):
-            with self.subTest(kind=kind):
-                if kind == 'corrupt':
-                    policy.write_text('credential-sentinel')
-                elif kind == 'directory':
-                    policy.mkdir()
-                elif kind == 'symlink':
-                    policy.symlink_to(ROOT / POLICY_RELATIVE_PATH)
-                with self.assertRaises(ValueError) as caught:
-                    chromium_policy_path(self.root)
-                self.assertNotIn('credential-sentinel', str(caught.exception))
-                if policy.is_symlink() or policy.is_file():
-                    policy.unlink()
-                elif policy.is_dir():
-                    policy.rmdir()
-        shutil.copyfile(ROOT / POLICY_RELATIVE_PATH, policy)
-        self.assertEqual(chromium_policy_path(self.root), policy.absolute())
-        policy.unlink()
-        policy.parent.rmdir()
-        policy.parent.symlink_to(ROOT / 'security', target_is_directory=True)
-        with self.assertRaises(ValueError):
-            chromium_policy_path(self.root)
-
-    def test_selected_daemon_compatibility_is_exact(self):
+    def test_selected_daemon_identity_validation(self):
         for server_arch, info_arch in [('amd64', 'amd64'), ('x86_64', 'amd64'),
                                        ('amd64', 'x86_64'), ('x86_64', 'x86_64')]:
             validate_chromium_daemon(dict(SERVER, Arch=server_arch), dict(INFO, Architecture=info_arch), docker_mode='none')
+        # Derivatives can report their own name and an upstream source commit.
+        alternative = dict(SERVER, Version='28.3.1-custom', Platform={'Name': 'Other Engine'},
+                           Components=[{'Name': 'Engine', 'Details': {'GitCommit': '06db1734'}}])
+        identity = validate_chromium_daemon(alternative, dict(INFO, ServerVersion='28.3.1-custom'),
+                                            docker_mode='sysbox')
+        self.assertEqual(identity['git_commit'], '06db1734')
+        self.assertEqual(identity['engine'], 'Other Engine')
         cases = [
             (None, INFO), ([], INFO), ({}, INFO), (SERVER, None), (SERVER, []), (SERVER, {}),
-            (dict(SERVER, Platform=None), INFO), (dict(SERVER, Platform={'Name': 'unknown'}), INFO),
-            (dict(SERVER, Version='29.9.3'), INFO), (dict(SERVER, Version='29.9.2-custom'), INFO),
+            (dict(SERVER, Platform=None), INFO), (dict(SERVER, GitCommit='../abc'), INFO),
+            (dict(SERVER, Version='29.9.3'), INFO), (dict(SERVER, Version='29.10.0-custom'), INFO),
             (dict(SERVER, Os='windows'), INFO), (dict(SERVER, Arch='arm64'), INFO),
             (SERVER, dict(INFO, ServerVersion='29.9.3')), (SERVER, dict(INFO, OSType='windows')),
             (SERVER, dict(INFO, Architecture='arm64')),
@@ -117,21 +76,26 @@ class SeccompTests(unittest.TestCase):
         cases.extend((SERVER, dict(INFO, SecurityOptions=value)) for value in
                      [None, [], 'name=seccomp,profile=builtin', [None], [17],
                       ['name=seccomp'], ['name=seccomp,profile=custom'], ['name=seccomp,profile=unconfined'],
-                      ['name=seccomp,profile=builtin-extra']])
+                      ['name=seccomp,profile=builtin-extra'], ['name=seccomp,profile=builtin', 'name=seccomp,profile=custom']])
         for server, info in cases:
             with self.subTest(server=server, info=info), self.assertRaises(ValueError):
                 validate_chromium_daemon(server, info, docker_mode='none')
+        other = dict(SERVER, Components=[{'Name':'Engine','Details':{'GitCommit':'abcdef1'}}])
         with self.assertRaises(ValueError):
-            validate_chromium_daemon(SERVER, INFO, docker_mode='sysbox')
+            validate_chromium_daemon(other, INFO, docker_mode='sysbox')
 
-    def test_resolver_probes_only_selected_daemon_and_returns_packaged_path(self):
-        runner = DaemonRunner()
-        self.assertEqual(resolve_desktop_seccomp(self.chromium, runner, program_dir=ROOT),
-                         ROOT / POLICY_RELATIVE_PATH)
-        self.assertEqual(runner.calls, [
-            (['docker', 'version', '--format', '{{json .Server}}'], {'capture_output': True}),
-            (['docker', 'info', '--format', '{{json .}}'], {'capture_output': True}),
-        ])
+    def test_both_modes_use_same_outer_identity_and_transport(self):
+        for mode in ('none', 'sysbox'):
+            runner = DaemonRunner()
+            with patch('claude_docker.seccomp_cache.resolve_cached_profile', return_value=self.root) as cache, patch.dict(os.environ, {'DOCKER_CONTEXT':'selected', 'SECRET':'hidden'}, clear=True):
+                selected = replace(self.chromium, docker_mode=mode)
+                self.assertEqual(resolve_desktop_seccomp(selected, runner, program_dir=self.root,
+                                 cache_dir=self.root, create=False), self.root)
+            cache.assert_called_once_with(self.root, dict(engine='Docker Engine - Community',
+                version='29.10.0', git_commit='06db173', os='linux', arch='amd64'), create=False)
+            self.assertEqual([argv[1] for argv, kwargs in runner.calls], ['version', 'info'])
+            for argv, kwargs in runner.calls:
+                self.assertEqual(kwargs['env'], {'DOCKER_CONTEXT':'selected'})
 
     def test_daemon_failures_and_malformed_output_are_redacted(self):
         secret = 'credential-sentinel'
@@ -142,13 +106,12 @@ class SeccompTests(unittest.TestCase):
                 resolve_desktop_seccomp(self.chromium, DaemonRunner(list(results)), program_dir=ROOT)
             self.assertNotIn(secret, str(caught.exception))
 
-    def test_unsafe_or_sysbox_opt_in_fails_before_probes(self):
+    def test_unsafe_opt_in_fails_before_probes(self):
         for config, unsafe in [(self.chromium, True),
-                               (replace(self.chromium, desktop=DesktopConfig(False, 'manual', 'chromium')), False),
-                               (replace(self.chromium, docker_mode='sysbox'), False)]:
+                               (replace(self.chromium, desktop=DesktopConfig(False, 'manual', 'chromium')), False)]:
             runner = DaemonRunner([])
             with self.subTest(config=config, unsafe=unsafe), self.assertRaisesRegex(
-                    ValueError, 'internal sandbox' if unsafe or not config.desktop.sandbox else 'docker_mode=none'):
+                    ValueError, 'internal sandbox'):
                 resolve_desktop_seccomp(config, runner, program_dir=self.root / 'missing', unsafe=unsafe)
             self.assertEqual(runner.calls, [])
 

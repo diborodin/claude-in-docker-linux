@@ -68,6 +68,97 @@ class ComposeFixture:
 
 
 class ComposeTests(ComposeFixture, unittest.TestCase):
+    def test_inner_docker_readiness_is_independent_of_runtime_mounts_and_mode_records(self):
+        runtime = DesktopRuntime(25, self.root / 'x11', self.root / 'Xauthority',
+                                 ProcessIdentity(123, 456, '/usr/bin/Xephyr'))
+        with patch.dict(os.environ, {'DOCKER_HOST': 'ssh://selected',
+                                     'DOCKER_CONFIG': '/outer/docker-config',
+                                     'COMPOSE_FILE': 'untrusted.yaml', 'SECRET': 'private'},
+                        clear=True):
+            project = self.project(config=replace(self.config, docker_mode='sysbox'),
+                                   desktop_runtime=runtime)
+        project.state.write_mode('none')
+        project.state.write_pending('none')
+        records = [project.state.path, project.state.pending_path]
+        before = [(path.read_bytes(), path.stat().st_ino) for path in records]
+        self.workspace.rmdir()
+
+        expected = ['docker', 'compose', '--project-name', f'claude-docker-{os.getuid()}',
+                    '-f', str(ROOT / 'compose.yaml'), '-f', str(ROOT / 'compose.sysbox.yaml'),
+                    'up', '-d', '--no-build', '--pull', 'never', '--no-recreate',
+                    '--no-deps', '--wait', '--wait-timeout', '120', 'inner-docker']
+        for stage in ('missing', 'stopped', 'healthy'):
+            with self.subTest(stage=stage):
+                # Docker selects create/start/reuse from one idempotent command.
+                self.runner.calls.clear()
+                project.ensure_inner_docker()
+                self.assertEqual(self.runner.calls, [(expected, {
+                    'capture_output': False,
+                    'env': {'DOCKER_HOST': 'ssh://selected', 'DOCKER_CONFIG': '/outer/docker-config',
+                            'COMPOSE_DISABLE_ENV_FILE': '1', 'CLAUDE_USER': 'tester',
+                            'CLAUDE_UID': '1234', 'CLAUDE_GID': '2345',
+                            'CLAUDE_HOME': '/home/tester', 'CLAUDE_HOST_UID': str(os.getuid())},
+                })])
+                self.assertFalse(self.paths.runtime_dir.exists())
+                self.assertEqual([(path.read_bytes(), path.stat().st_ino) for path in records], before)
+
+    def test_inner_docker_readiness_in_none_mode_does_not_run_docker_or_write_files(self):
+        self.project().ensure_inner_docker()
+        self.assertEqual(self.runner.calls, [])
+        self.assertFalse(self.paths.runtime_dir.exists())
+        self.assertFalse(self.paths.state_dir.exists())
+
+    def test_inner_docker_readiness_propagates_compose_failure_with_pull_guidance(self):
+        project = self.project(config=replace(self.config, docker_mode='sysbox'))
+        self.runner.fail_operation = 'inner-docker'
+        stderr = io.StringIO()
+        with self.assertRaises(subprocess.CalledProcessError) as error, redirect_stderr(stderr):
+            project.ensure_inner_docker()
+        self.assertEqual(error.exception.returncode, 7)
+        self.assertEqual(len(self.runner.calls), 1)
+        self.assertEqual(self.runner.calls[0][0][-4:], ['--wait', '--wait-timeout', '120', 'inner-docker'])
+        self.assertIn('inner-docker', stderr.getvalue())
+        self.assertIn('claude-docker pull', stderr.getvalue())
+        self.assertFalse(self.paths.runtime_dir.exists())
+        self.assertFalse(self.paths.state_dir.exists())
+
+    def test_failed_initial_sysbox_desktop_start_records_inner_docker_for_teardown(self):
+        for old_mode, old_pending in ((None, None), ('none', None), ('sysbox', 'sysbox')):
+            for failure_point in ('inner-docker', 'display'):
+                with self.subTest(old_mode=old_mode, old_pending=old_pending, failure=failure_point):
+                    project = self.project(config=replace(self.config, docker_mode='sysbox'))
+                    project.state.clear_mode()
+                    project.state.clear_pending()
+                    if old_mode is not None:
+                        project.state.write_mode(old_mode)
+                    if old_pending is not None:
+                        project.state.write_pending(old_pending)
+                    self.runner.calls.clear()
+                    self.runner.fail_operation = failure_point
+
+                    def prepare_display():
+                        self.assertEqual(failure_point, 'display')
+                        raise ValueError('display setup failed')
+
+                    with self.assertRaises((subprocess.CalledProcessError, ValueError)):
+                        project.up('claude-desktop', before_start=prepare_display)
+                    ups = [argv[-1] for argv, _ in self.runner.calls if 'up' in argv]
+                    self.assertEqual(ups, ['inner-docker'])
+                    self.assertEqual(project.state.read_mode(), old_mode)
+                    self.assertEqual(project.state.read_pending(), 'sysbox')
+
+                    # Explicit recovery must still select the Sysbox model even
+                    # when there is no launch configuration or the old mode is none.
+                    self.runner.calls.clear()
+                    ComposeProject.for_teardown(self.paths, self.runner).down()
+                    downs = [argv for argv, _ in self.runner.calls]
+                    self.assertEqual(len(downs), 2 if old_mode == 'none' else 1)
+                    self.assertEqual(
+                        sum('down' in argv and str(ROOT / 'compose.sysbox.yaml') in argv
+                            for argv in downs), 1)
+                    self.assertIsNone(project.state.read_pending())
+                    self.assertIsNone(project.state.read_mode())
+
     def test_build_uses_private_literal_context_override_without_runtime_mutation(self):
         project = self.project()
         context = self.root / 'selected $TOKEN, space'
@@ -151,12 +242,39 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'teardown'):
                     action()
             self.assertEqual(self.runner.calls, [])
+            self.runner.stdout = ''  # No unrecorded dependency on the selected daemon.
             project.down()
             argv = self.runner.calls[-1][0]
             self.assertEqual(argv[argv.index('--project-name') + 1], 'claude-docker-0')
             self.assertEqual(self.runner.calls[-1][1]['env']['CLAUDE_HOST_UID'], '0')
         self.assertFalse(self.paths.runtime_dir.exists())
         self.assertFalse(self.paths.state_dir.exists())
+
+    def test_config_free_teardown_rejects_mode_published_during_discovery(self):
+        project = ComposeProject.for_teardown(self.paths, self.runner)
+        original_run = self.runner.run
+
+        def run(argv, **kwargs):
+            result = original_run(argv, **kwargs)
+            if argv[:3] == ['docker', 'container', 'ls']:
+                project.state.write_mode('sysbox')
+                result.stdout = 'a' * 64 + '\n'
+            return result
+
+        with patch.object(self.runner, 'run', side_effect=run), self.assertRaisesRegex(ValueError, 'changed'):
+            project.down()
+
+        self.assertEqual(project.state.read_mode(), 'sysbox')
+        self.assertEqual([argv[:3] for argv, _ in self.runner.calls], [['docker', 'container', 'ls']])
+
+    def test_config_free_teardown_rejects_non_id_discovery_output(self):
+        self.runner.stdout = 'a' * 64 + '\nother-container\n'
+        project = ComposeProject.for_teardown(self.paths, self.runner)
+
+        with self.assertRaisesRegex(ValueError, 'Invalid inner-docker container ID'):
+            project.down()
+
+        self.assertEqual([argv[:3] for argv, _ in self.runner.calls], [['docker', 'container', 'ls']])
 
     def test_normal_removal_uses_both_recorded_models_without_mounts_or_volume_flags(self):
         project = ComposeProject.for_teardown(self.paths, self.runner)

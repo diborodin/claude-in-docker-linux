@@ -125,7 +125,7 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(runtime.xephyr_identity, ProcessIdentity(123, 456, '/usr/bin/Xephyr'))
         authority_fd = self.popen_kwargs['pass_fds'][0]
         self.assertEqual(self.argv, ['Xephyr', ':20', '-auth', f'/proc/self/fd/{authority_fd}/Xauthority',
-                                    '-nolisten', 'tcp', '-screen', '1024x768', '-resizeable'])
+                                    '-nolisten', 'tcp', '-extension', 'MIT-SHM', '-screen', '1024x768', '-resizeable'])
         self.assertTrue(self.popen_kwargs['start_new_session'])
         self.assertNotIn('-ac', self.argv)
         self.assertEqual(stat.S_IMODE(runtime.xauthority.stat().st_mode), 0o600)

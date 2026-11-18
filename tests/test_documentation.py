@@ -55,13 +55,13 @@ class DocumentationTests(unittest.TestCase):
         # can ship checkout state. This release inventory is deliberately fixed.
         modules = {'__init__', '__main__', 'checks', 'cli', 'clipboard', 'commands',
                    'compose', 'config', 'desktop', 'environment', 'installer', 'manifest',
-                   'model', 'mounts', 'paths', 'process', 'seccomp', 'state', 'uninstall', 'tool_config', 'image_tools',
+                   'model', 'mounts', 'paths', 'process', 'seccomp', 'seccomp_source', 'seccomp_cache', 'seccomp_profile',
+                   'state', 'uninstall', 'tool_config', 'image_tools',
                    'customize', 'claude_version'}
         expected = {'.dockerignore', 'claude-docker', 'install', 'VERSION', 'README.md', 'LICENSE',
                     'Dockerfile', 'compose.yaml', 'compose.sysbox.yaml', 'config.example.toml',
                     'image/customize.sh', 'image/customize.example.sh', 'image/mise.lock', 'image/mise.toml',
                     'image/claude-code.version',
-                    'security/desktop-seccomp-v0.2.4-linux-amd64.json',
                     'security/LICENSE.moby-profiles', 'security/NOTICE.moby-profiles'}
         expected |= {f'src/claude_docker/{module}.py' for module in modules}
         manifest, inputs = installer._source_manifest(ROOT, 'user', __version__)
@@ -84,7 +84,7 @@ class DocumentationTests(unittest.TestCase):
     def test_version_matches_package_and_executable_from_unrelated_directory(self):
         version = (ROOT / 'VERSION').read_text().strip()
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$')
-        self.assertEqual(version, '0.3.4')
+        self.assertEqual(version, '0.3.7')
         self.assertEqual(__version__, version)
         with tempfile.TemporaryDirectory() as directory:
             env = {'HOME': directory, 'PATH': '', 'PYTHONDONTWRITEBYTECODE': '1'}
@@ -270,8 +270,8 @@ class DocumentationTests(unittest.TestCase):
     def test_manual_explains_explicit_seccomp_opt_in_and_limits(self):
         section = self.section('Use Claude Desktop')
         self.contains_all(section, ['seccomp = "default"', 'seccomp = "chromium"',
-                                   'CLAUDE_DESKTOP_SECCOMP', '29.9.2', 'Community',
-                                   'amd64', 'docker_mode = "none"', 'Sysbox',
+                                   'CLAUDE_DESKTOP_SECCOMP', 'GitCommit', 'HTTPS', 'offline',
+                                   'amd64', '`none`', '`sysbox`', 'Sysbox',
                                    'claude-docker desktop --restart'])
         self.assertRegex(section, r'(?is)kernel.*namespace.*attack surface')
         self.assertRegex(section, r'(?is)no automatic fallback')

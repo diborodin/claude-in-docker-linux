@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from claude_docker import cli, installer
 from claude_docker.installer import InstallLayout, install_release, install_development
-from claude_docker.seccomp import POLICY_RELATIVE_PATH
 
 
 class UninstallTests(unittest.TestCase):
@@ -127,14 +126,13 @@ class UninstallTests(unittest.TestCase):
         layout = InstallLayout.development(source, self.layout.command_link.parent,
                          metadata_root=self.layout.root, host_paths=self.layout.host_paths)
         install_development(source, layout)
-        (source / POLICY_RELATIVE_PATH).unlink()
         config = self.write(layout.host_paths.config_file,
                             '[desktop]\nseccomp = "chromium"\n')
         sentinel = self.write(source / 'untracked-file')
         user_data = self.write(self.home / '.claude/token')
         worker, authority = self.recorded_runtime()
         before = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob('*') if path.is_file()}
-        with patch('claude_docker.seccomp.chromium_policy_path', side_effect=AssertionError('policy lookup')):
+        with patch('claude_docker.seccomp_cache.resolve_cached_profile', side_effect=AssertionError('policy lookup')):
             api.uninstall_user(layout)
         self.assertTrue(all(path.exists() for path in (sentinel, user_data, config)))
         self.assertEqual(before, {str(path.relative_to(source)): path.read_bytes() for path in source.rglob('*') if path.is_file()})
@@ -148,7 +146,7 @@ class UninstallTests(unittest.TestCase):
         api = self.api()
         self.install()
         self.write(self.layout.host_paths.config_file, '[desktop]\nseccomp = "chromium"\n')
-        policy = self.layout.release_dir('0.1.0') / POLICY_RELATIVE_PATH
+        policy = self.layout.release_dir('0.1.0') / 'src/claude_docker/seccomp_source.py'
         policy.unlink()
         self.assert_rejected_untouched(lambda: api.uninstall_user(self.layout))
         self.assertTrue(self.layout.registry_file.exists())

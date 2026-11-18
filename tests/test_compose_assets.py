@@ -10,7 +10,6 @@ import unittest
 
 from tests.test_compose import ComposeFixture
 from claude_docker.model import DesktopRuntime, ProcessIdentity
-from claude_docker.seccomp import POLICY_RELATIVE_PATH, chromium_policy_path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -222,14 +221,13 @@ class RuntimeGrantAssetTests(ComposeFixture, unittest.TestCase):
     def test_rendered_opt_in_preserves_literal_policy_path_and_desktop_only_grant(self):
         # Exercise our escaping at Compose's rendered boundary, without a daemon.
         program = self.root / 'program space $HOME,comma'
-        policy = program / POLICY_RELATIVE_PATH
+        policy = program / 'desktop.json'
         policy.parent.mkdir(parents=True)
-        shutil.copyfile(ROOT / POLICY_RELATIVE_PATH, policy)
-        validated = chromium_policy_path(program)
+        policy.write_text('{}')
         runtime = DesktopRuntime(25, self.root / 'x11', self.root / 'Xauthority',
                                  ProcessIdentity(123, 456, '/usr/bin/Xephyr'))
         config = replace(self.config, container=replace(self.config.container, uid=os.getuid()))
-        project = self.project(config=config, desktop_runtime=runtime, desktop_seccomp=validated)
+        project = self.project(config=config, desktop_runtime=runtime, desktop_seccomp=policy)
         for mode, files in (('none', ('compose.yaml',)),
                             ('sysbox', ('compose.yaml', 'compose.sysbox.yaml'))):
             with self.subTest(mode=mode):

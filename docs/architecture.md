@@ -55,7 +55,7 @@ readable to the application, the Docker daemon, and permitted process inspectors
 
 ## Images and Compose
 
-Both products use Ubuntu 24.04. The `common` stage provides the mirrored account,
+Both products use Ubuntu 26.04. The `common` stage provides the mirrored account,
 Docker client tools, and the image tool manager. The `cli` stage adds
 configured development tools. The `desktop-runtime` stage adds the
 Desktop package and graphical dependencies; the `desktop` target adds development
@@ -125,6 +125,21 @@ provides a separate inner Docker daemon, mutual TLS, and named storage. It needs
 a separately installed Sysbox runtime. The host Docker socket is not mounted.
 No service uses privileged mode. Ubuntu 24.04 is the intended Sysbox reference
 host; Debian 13 use is experimental and live Sysbox qualification remains open.
+
+Desktop waits for `inner-docker` with a service-only Compose start that has a
+120-second health timeout. Dependency repair preserves existing containers and
+uses the base and Sysbox models without runtime grants. Startup and reuse
+wait before changing the Desktop session. Ordinary Desktop startup handles
+any required mode recovery first, then starts Desktop with dependencies excluded
+from that Compose operation. Desktop-only restart still requires a compatible
+recorded mode and no pending transition.
+
+The optional Chromium policy uses the outer Docker server GitCommit to resolve
+an exact published official Moby release tag for the daemon version, then fetch the
+profiles dependency at its published tag, baseline and license over HTTPS. The private
+cache verifies the baseline, derivation and provenance on reuse. Desktop launch
+uses a new cache key for this resolution scheme. Keep the real cache path free of
+symlink ancestors. Desktop compares the requested policy with the running container before reuse.
 
 ## Installation and removal
 

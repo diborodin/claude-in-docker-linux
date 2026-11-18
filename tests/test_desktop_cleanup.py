@@ -34,6 +34,103 @@ class RecordedCleanupTests(unittest.TestCase):
     def exited(self):
         shutil.rmtree(self.fixture.proc / '123')
 
+    def restart_desktop(self, start, *, mode='none', runner=None):
+        fixture = test_desktop.DesktopComposeTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        config = replace(fixture.config,
+                         docker_mode=mode,
+                         container=replace(fixture.config.container, uid=os.getuid()),
+                         environment=replace(fixture.config.environment, required=()))
+        if runner is None:
+            runner = test_desktop_cli.DesktopRunner()
+        RuntimeState(self.paths.state_dir).write_mode(mode)
+        with (patch.dict(os.environ, {'DISPLAY': ':0'}, clear=True),
+              patch.object(desktop, 'resolve_host_paths', return_value=self.paths),
+              patch.object(desktop, 'CommandRunner', return_value=runner),
+              patch.object(desktop.XephyrManager, 'start', side_effect=start),
+              patch.object(desktop.time, 'sleep'),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            result = desktop.launch_desktop(config, restart=True, clipboard_sync=False,
+                                            no_sandbox=False, app_args=())
+        return result, runner
+
+    def test_restart_removes_dead_xephyr_record_before_starting_only_desktop(self):
+        self.exited()
+        (self.fixture.x11 / 'X20').unlink()
+        self.assertTrue((self.runtime.socket_dir / 'X20').exists())
+
+        def start():
+            self.assertFalse(self.manager.record_path.exists())
+            self.assertFalse(self.runtime.xauthority.exists())
+            self.assertFalse((self.runtime.socket_dir / 'X20').exists())
+            self.runtime.xauthority.touch(mode=0o600)
+            return self.runtime
+
+        result, runner = self.restart_desktop(start)
+        self.assertEqual(result, 0)
+        self.assertEqual(self.fixture.signals, [])
+        commands = [argv for argv, _ in runner.calls]
+        up = next(argv for argv in commands if 'up' in argv)
+        self.assertIn('--no-deps', up)
+        self.assertEqual(up[-1], 'claude-desktop')
+        self.assertFalse(any('down' in argv or 'claude-cli' in argv or 'inner-docker' in argv
+                             for argv in commands))
+
+    def test_sysbox_restart_dependency_failure_preserves_recorded_display_and_clipboard(self):
+        runner = test_desktop_cli.DesktopRunner()
+        runner.container_running = runner.running = True
+        clipboard_record = self.paths.runtime_dir / 'clipboard.json'
+        worker = ProcessIdentity(234, 567, str(Path(sys.executable).resolve()))
+        directory = self.manager._open_private(self.paths.runtime_dir)
+        try:
+            clipboard.ClipboardSync(self.paths)._save(directory, dict(
+                identity=asdict(worker), runtime={}, host_display=':0'))
+        finally:
+            os.close(directory)
+        self.exited()
+        records = [self.manager.record_path, self.runtime.xauthority, clipboard_record]
+        before = [(path.read_bytes(), path.stat().st_ino) for path in records]
+        original = runner.run
+
+        def run(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if 'up' in argv and argv[-1] == 'inner-docker':
+                raise subprocess.CalledProcessError(7, argv)
+            return result
+
+        with patch.object(runner, 'run', side_effect=run), \
+                patch.object(clipboard, 'process_identity', return_value=None):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.restart_desktop(lambda: self.fail('must not start before readiness'),
+                                     mode='sysbox', runner=runner)
+        self.assertEqual([argv[-1] for argv, _ in runner.calls], ['inner-docker'])
+        self.assertTrue(runner.container_running)
+        self.assertEqual([(path.read_bytes(), path.stat().st_ino) for path in records], before)
+        self.assertTrue((self.runtime.socket_dir / 'X20').is_socket())
+        self.assertEqual(self.fixture.signals, [])
+        state = RuntimeState(self.paths.state_dir)
+        self.assertEqual(state.read_mode(), 'sysbox')
+        self.assertIsNone(state.read_pending())
+
+    def test_restart_refuses_reused_pid_and_preserves_record(self):
+        self.fixture.identity(ticks=999)
+        with self.assertRaisesRegex(ValueError, 'identity'):
+            self.restart_desktop(lambda: self.fail('must not start after PID reuse'))
+        self.assertEqual(self.fixture.signals, [])
+        self.assertTrue(self.manager.record_path.exists())
+        self.assertTrue(self.runtime.xauthority.exists())
+
+    def test_restart_refuses_recorded_non_xephyr_process(self):
+        self.fixture.identity(exe='/usr/bin/bash')
+        value = json.loads(self.manager.record_path.read_text())
+        value['xephyr_identity']['executable'] = '/usr/bin/bash'
+        self.manager.record_path.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'Xephyr'):
+            self.restart_desktop(lambda: self.fail('must not start after executable substitution'))
+        self.assertEqual(self.fixture.signals, [])
+        self.assertTrue(self.manager.record_path.exists())
+
     def public_stop_with_broken_configuration(self, text, *, bad_program=False, fail_down=False):
         self.paths.config_dir.mkdir(parents=True, exist_ok=True)
         self.paths.config_file.write_text(text)
@@ -101,7 +198,7 @@ class RecordedCleanupTests(unittest.TestCase):
         with (patch.dict(os.environ, {'HOME': str(self.paths.home), 'CLAUDE_DOCKER_DIR': str(missing)}, clear=True),
               patch.object(cli, 'resolve_host_paths', return_value=self.paths),
               patch.object(cli, 'CommandRunner', return_value=runner),
-              patch('claude_docker.seccomp.chromium_policy_path', side_effect=AssertionError('policy lookup')),
+              patch('claude_docker.seccomp_cache.resolve_cached_profile', side_effect=AssertionError('policy lookup')),
               redirect_stdout(io.StringIO()), redirect_stderr(error)):
             self.assertEqual(cli.main(['stop']), 0, error.getvalue())
         commands = [argv for argv, _ in runner.calls]
@@ -378,6 +475,7 @@ class LaunchCleanupTests(ComposeFixture, unittest.TestCase):
         self.assertTrue(any(argv[-2:] == ['stop', 'claude-desktop'] for argv, _ in self.runner.calls))
 
     def test_restart_stops_worker_before_service(self):
+        self.fixture.project().state.write_mode('none')
         events = []
         original = self.runner.run
         def run(argv, **kwargs):
