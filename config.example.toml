@@ -45,3 +45,8 @@ optional = []
 # AWS example: replace the empty required list above with:
 # required = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
 # optional = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+
+[hooks]
+# Optional trusted Bash script sourced on the host before each new Claude process.
+# pre_launch = "~/.config/claude-docker/pre-launch.sh"
+timeout_seconds = 60

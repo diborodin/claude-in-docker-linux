@@ -13,8 +13,8 @@ from .checks import cleanup_inner_docker, lock_tools, run_checks
 from .commands import CommandRunner
 from .compose import ComposeProject
 from .config import AccountInfo, load_config, resolve_config_file, write_example_config
-from .environment import select_environment_names
 from .desktop import launch_desktop, stop_desktop_runtime
+from .hooks import launch_environment
 from .image_tools import image_build_inputs
 from .mounts import container_workdir, prepare_mounts
 from .paths import resolve_host_paths, resolve_program_dir
@@ -383,18 +383,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == 'desktop':
                 return launch_desktop(config, restart=args.restart, clipboard_sync=args.clipboard_sync,
                                       no_sandbox=args.no_sandbox, app_args=desktop_args)
-            env_names = select_environment_names(config.environment, os.environ) if args.command == 'claude' else ()
-            mounts = prepare_mounts(config) if args.command == 'claude' else ()
-            project = ComposeProject(config, paths, mounts, CommandRunner())
             if args.command == 'claude':
+                env_names, app_env = launch_environment(config.hooks, config.environment, os.environ)
+                mounts = prepare_mounts(config)
+                project = ComposeProject(config, paths, mounts, CommandRunner())
                 workdir = container_workdir(Path.cwd(), mounts, config.container.home)
                 project.up('claude-cli')
                 container = project.container_id('claude-cli')
                 project.report_versions(container)
                 return project.exec('claude-cli', ['claude', *claude_args], workdir=workdir,
-                                    env_names=env_names, interactive=True,
+                                    env_names=env_names, env=app_env, interactive=True,
                                     tty=sys.stdin.isatty() and sys.stdout.isatty(), container=container)
-            elif args.command in ('build', 'rebuild'):
+            project = ComposeProject(config, paths, (), CommandRunner())
+            if args.command in ('build', 'rebuild'):
                 rebuild = args.command == 'rebuild'
                 services = (('claude-cli', 'claude-desktop') if args.all else
                             ('claude-desktop',) if args.desktop or args.update_desktop else ('claude-cli',))

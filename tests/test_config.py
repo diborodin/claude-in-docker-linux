@@ -63,6 +63,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(desktop.keyboard_layout, 'us,ru')
         self.assertEqual(desktop.keyboard_options, 'grp:alt_shift_toggle')
 
+    def test_pre_launch_hook_defaults_and_host_home_expansion(self):
+        self.assertIsNone(self.load().hooks.pre_launch)
+        self.assertEqual(self.load().hooks.timeout_seconds, 60)
+        hook = self.load('[hooks]\npre_launch = "~/hook with spaces.sh"\ntimeout_seconds = 15').hooks
+        self.assertEqual(hook.pre_launch, self.home / 'hook with spaces.sh')
+        self.assertEqual(hook.timeout_seconds, 15)
+
+    def test_invalid_hook_settings_are_rejected_without_exposing_values(self):
+        for setting, literal in (('pre_launch', '"relative-secret.sh"'), ('pre_launch', 'false'),
+                                 ('pre_launch', '""'), ('timeout_seconds', 'true'),
+                                 ('timeout_seconds', '0'), ('timeout_seconds', '-1'),
+                                 ('timeout_seconds', '1.5'), ('timeout_seconds', '"30"'),
+                                 ('post_launch', 'true')):
+            with self.subTest(setting=setting, literal=literal):
+                with self.assertRaisesRegex(ValueError, r'hooks\.' + setting) as caught:
+                    self.load(f'[hooks]\n{setting} = {literal}')
+                self.assertNotIn('relative-secret.sh', str(caught.exception))
+
     def test_desktop_keyboard_process_overrides_toml(self):
         text = '[desktop]\nkeyboard_layout = "de,gb"\nkeyboard_options = "grp:win_space_toggle,ctrl:nocaps"'
         desktop = self.load(text).desktop

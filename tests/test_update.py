@@ -126,7 +126,7 @@ class UpdateTests(InstallFixture):
                 for path, value in zip(user_inputs, (b'2.2.99\n', b'2:5.10-1\n', b'#!/bin/bash\n', b'[tools]\n')):
                     path.write_bytes(value)
                 before = [self.snapshot(path) for path in user_inputs]
-                desktop_files = DESKTOP_VERSION_FILES | {DESKTOP_RESOLVER_FILE}
+                desktop_files = DESKTOP_VERSION_FILES | {DESKTOP_RESOLVER_FILE, 'src/claude_docker/hooks.py'}
                 old = self.trim_release_inventory(desktop_files, '0.3.7')
                 self.assertEqual(len(old['files']), 43)
                 if replacement == '0.3.7':
@@ -150,7 +150,7 @@ class UpdateTests(InstallFixture):
                 self.layout = InstallLayout.user(env)
                 installed = self.install('0.3.7')
                 self.assertIn(DESKTOP_RESOLVER_FILE, {str(item.path) for item in installed.files})
-                old = self.trim_release_inventory({DESKTOP_RESOLVER_FILE}, '0.3.7')
+                old = self.trim_release_inventory({DESKTOP_RESOLVER_FILE, 'src/claude_docker/hooks.py'}, '0.3.7')
                 self.assertEqual(len(old['files']), 47)
                 if replacement == '0.3.7':
                     with self.assertRaisesRegex(ValueError, 'Release version collision'):
@@ -203,7 +203,7 @@ class UpdateTests(InstallFixture):
         hook.write_bytes(b'untouched user script')
         before = self.snapshot(hook)
         manifest = self.install('0.3.1')
-        self.assertEqual(len(manifest.files), 48)
+        self.assertEqual(len(manifest.files), 49)
         self.assertEqual(self.snapshot(hook), before)
         self.assert_command_works('0.3.1')
 
@@ -216,7 +216,7 @@ class UpdateTests(InstallFixture):
         pin.write_bytes(b'  2.2.99\n')
         before = self.snapshot(pin)
         manifest = self.install('0.3.4')
-        self.assertEqual(len(manifest.files), 48)
+        self.assertEqual(len(manifest.files), 49)
         self.assertEqual(self.snapshot(pin), before)
         shipped = self.layout.release_dir('0.3.4') / 'image/claude-code.version'
         self.assertEqual(shipped.read_bytes(), b'latest\n')
@@ -254,7 +254,7 @@ class UpdateTests(InstallFixture):
         before = {path: self.snapshot(path) for path in files}
         with patch.dict(os.environ, dict(self.env, CLAUDE_MISE_CONFIG_FILE=str(files[2])), clear=True):
             manifest = self.install('0.3.0')
-            self.assertEqual(len(manifest.files), 48)
+            self.assertEqual(len(manifest.files), 49)
         for path in files:
             self.assertEqual(self.snapshot(path), before[path])
             self.assertNotIn(str(path), {str(item.path) for item in manifest.files})

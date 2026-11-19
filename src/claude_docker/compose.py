@@ -1,6 +1,6 @@
 """Structured Compose overrides and mode-aware Docker orchestration."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 import json
 import os
@@ -343,13 +343,14 @@ class ComposeProject:
 
     def exec(self, service: str, command: Sequence[str], *, workdir: Path,
              env_names: Sequence[str], interactive: bool, tty: bool,
-             detach: bool = False, capture_output: bool = False, container: str | None = None) -> int:
+             detach: bool = False, capture_output: bool = False, container: str | None = None,
+             env: Mapping[str, str] | None = None) -> int:
         argv = docker_exec_argv(container if container is not None else self.container_id(service), command, workdir=workdir,
                                 env_names=env_names, interactive=interactive,
                                 tty=tty, detach=detach)
-        # No env mapping: Docker reads selected names from the current launcher
-        # environment. Values never enter arguments or Compose configuration.
-        return self.runner.run(argv, check=False, capture_output=capture_output).returncode
+        # Docker reads selected names from its child environment (inherited
+        # when env is None). Values stay out of arguments and Compose files.
+        return self.runner.run(argv, env=env, check=False, capture_output=capture_output).returncode
 
     def build(self, service: str, *, pull: bool, no_cache: bool,
               build_context: Path | None = None) -> None:

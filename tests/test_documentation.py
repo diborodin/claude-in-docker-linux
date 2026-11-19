@@ -54,7 +54,7 @@ class DocumentationTests(unittest.TestCase):
         # An omitted module breaks installed imports; an added unreviewed input
         # can ship checkout state. This release inventory is deliberately fixed.
         modules = {'__init__', '__main__', 'checks', 'cli', 'clipboard', 'commands',
-                   'compose', 'config', 'desktop', 'environment', 'installer', 'manifest',
+                   'compose', 'config', 'desktop', 'environment', 'hooks', 'installer', 'manifest',
                    'model', 'mounts', 'paths', 'process', 'seccomp', 'seccomp_source', 'seccomp_cache', 'seccomp_profile',
                    'state', 'uninstall', 'tool_config', 'image_tools',
                    'customize', 'claude_version', 'desktop_resolver', 'desktop_version', 'version_pin'}
@@ -84,7 +84,7 @@ class DocumentationTests(unittest.TestCase):
     def test_version_matches_package_and_executable_from_unrelated_directory(self):
         version = (ROOT / 'VERSION').read_text().strip()
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$')
-        self.assertEqual(version, '0.4.5')
+        self.assertEqual(version, '0.4.6')
         self.assertEqual(__version__, version)
         with tempfile.TemporaryDirectory() as directory:
             env = {'HOME': directory, 'PATH': '', 'PYTHONDONTWRITEBYTECODE': '1'}
@@ -108,7 +108,7 @@ class DocumentationTests(unittest.TestCase):
         self.assertEqual(example, config.EXAMPLE_CONFIG)
         # Identity stays optional in the shipped example; activate its documented
         # assignments to check those accepted keys alongside every active key.
-        complete = re.sub(r'^# ((?:user|uid|gid|home) = .+)$', r'\1', example, flags=re.M)
+        complete = re.sub(r'^# ((?:user|uid|gid|home|pre_launch) = .+)$', r'\1', example, flags=re.M)
         data = tomllib.loads(complete)
 
         def leaves(table, prefix=''):
@@ -166,8 +166,8 @@ class DocumentationTests(unittest.TestCase):
     def test_navigation_and_size(self):
         self.assertEqual(HEADINGS, re.findall(r'^## (.+)$', self.prose, re.M))
         self.assertEqual(1, len(re.findall(r'^# [^#]', self.prose, re.M)))
-        # Allow the image update workflow in the compact manual.
-        self.assertLessEqual(len(self.text.splitlines()), 730)
+        # Allow the image update and host pre-launch workflows in the compact manual.
+        self.assertLessEqual(len(self.text.splitlines()), 790)
         self.assertRegex(self.text, r'\]\((?:\./)?config\.example\.toml\)')
 
     def test_ordinary_install_and_cli_procedures_precede_optional_features(self):
@@ -365,6 +365,11 @@ class DocumentationTests(unittest.TestCase):
         candidates = self.shell.splitlines() + re.findall(r'`([^`\n]+)`', self.text)
         commands = set()
         for candidate in candidates:
+            # Shell examples can contain multiline quoted assignments. Only
+            # complete launcher command lines belong to this parser check.
+            if not re.match(r'^(?:sudo\s+)?(?:claude-docker|\./claude-docker|\./install)(?:\s|$)',
+                            candidate.strip()):
+                continue
             words = shlex.split(candidate.strip())
             if words[:1] == ['sudo']:
                 words = words[1:]

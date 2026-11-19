@@ -593,6 +593,58 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         self.assertEqual(commands[-1][-1], 'down')
         self.assertTrue(all(str(ROOT / 'compose.yaml') in cmd for cmd in commands))
 
+    def test_cli_pre_launch_hook_prepares_mounts_and_supplies_only_selected_app_values(self):
+        import shutil
+
+        binary = self.root / 'bin'
+        binary.mkdir()
+        (binary / 'bash').symlink_to(shutil.which('bash'))
+        docker = binary / 'docker'
+        docker.write_text('#!' + sys.executable + '\nimport json,os,sys\n'
+                          'args = sys.argv[1:]\n'
+                          'with open(os.environ["HOME"] + "/commands.jsonl", "a") as f:\n'
+                          '    print(json.dumps([args, {name:os.getenv(name) for name in '
+                          '("TOKEN","HIDDEN","PATH","DOCKER_HOST")}]),file=f)\n'
+                          'if "ps" in args: print("fixture-container")\n')
+        docker.chmod(0o755)
+        script = self.root / 'prepare work.sh'
+        script.write_text('[[ $PWD == "$HOME" ]]\n/bin/mkdir "$HOME/new-workspace"\n'
+                          'export TOKEN=$\'synthetic="quotes"\\nnext line\' HIDDEN=unselected\n'
+                          'export PATH=/untrusted DOCKER_HOST=ssh://untrusted\n')
+        config_file = self.root / 'settings.toml'
+        config_file.write_text('[container]\nmounts = ["~/new-workspace"]\n'
+                               '[environment]\nrequired = ["TOKEN"]\noptional = ["PATH", "DOCKER_HOST"]\n'
+                               '[hooks]\npre_launch = "~/prepare work.sh"\n')
+        runtime = self.root / 'run-base'
+        runtime.mkdir(mode=0o700)
+        env = {'PATH': str(binary), 'HOME': str(self.root), 'CLAUDE_CONFIG_FILE': str(config_file),
+               'XDG_RUNTIME_DIR': str(runtime), 'DOCKER_HOST': 'ssh://caller', 'PYTHONDONTWRITEBYTECODE': '1'}
+        result = subprocess.run([sys.executable, '-B', str(ROOT / 'claude-docker'), 'claude', '--print'],
+                                cwd=self.root, env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / 'new-workspace').is_dir())
+        calls = [json.loads(line) for line in (self.root / 'commands.jsonl').read_text().splitlines()]
+        [(argv, child)] = [(argv, child) for argv, child in calls if argv[-2:] == ['claude', '--print']]
+        self.assertEqual([argv[index + 1] for index, arg in enumerate(argv) if arg == '--env'],
+                         ['TOKEN', 'PATH', 'DOCKER_HOST'])
+        self.assertEqual(child, {'TOKEN': 'synthetic="quotes"\nnext line', 'HIDDEN': None,
+                                 'PATH': str(binary), 'DOCKER_HOST': 'ssh://caller'})
+        self.assertTrue(all(child['TOKEN'] is None for argv, child in calls if argv[-1] != '--print'))
+        override = (runtime / 'claude-docker/compose.none.json').read_text()
+        self.assertIn(str(self.root / 'new-workspace'), override)
+        for output in [result.stdout, result.stderr, override, *(str(argv) for argv, _ in calls)]:
+            self.assertNotIn('synthetic=', output)
+
+        log = self.root / 'commands.jsonl'
+        log.unlink()
+        script.write_text('export TOKEN=never-forward; exit 9\n')
+        result = subprocess.run([sys.executable, '-B', str(ROOT / 'claude-docker'), 'claude'],
+                                cwd=self.root, env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('hooks.pre_launch', result.stderr)
+        self.assertNotIn('never-forward', result.stderr)
+        self.assertFalse(log.exists())
+
     def test_cli_build_targets_require_explicit_desktop_or_all_selection(self):
         config_dir = self.home / '.config/claude-docker'
         self.seed_code_version(config_dir)

@@ -258,8 +258,8 @@ class CodeResolverProcessTests(unittest.TestCase):
         for name in ('sitecustomize.py', 'claude_docker.py'):
             (self.root / name).write_text("raise AssertionError('untrusted startup')\n")
         layout = InstallLayout.user(self.env)
-        install_release(ROOT, layout, version='0.4.5')
-        program = layout.release_dir('0.4.5')
+        install_release(ROOT, layout, version='0.4.6')
+        program = layout.release_dir('0.4.6')
         with self.stderr.open('w') as stderr, self.start(stderr, 'environment', program) as process:
             stdout, _ = process.communicate(timeout=4)
             self.assertEqual(process.returncode, 0, self.stderr.read_text())

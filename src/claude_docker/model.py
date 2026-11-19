@@ -36,6 +36,12 @@ class EnvironmentConfig:
 
 
 @dataclass(frozen=True)
+class HooksConfig:
+    pre_launch: Path | None = None
+    timeout_seconds: int = 60
+
+
+@dataclass(frozen=True)
 class AppConfig:
     docker_mode: Literal["none", "sysbox"]
     container: ContainerConfig
@@ -44,6 +50,7 @@ class AppConfig:
     state_desktop: StateMountConfig
     desktop: DesktopConfig
     environment: EnvironmentConfig
+    hooks: HooksConfig = HooksConfig()
 
 
 @dataclass(frozen=True)

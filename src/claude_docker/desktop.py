@@ -19,7 +19,7 @@ import time
 
 from .commands import CommandRunner
 from .compose import ComposeProject, validate_desktop_uid
-from .environment import select_environment_names
+from .hooks import launch_environment
 from .model import AppConfig, DesktopConfig, DesktopRuntime, ProcessIdentity
 from .mounts import prepare_mounts
 from .process import docker_exec_argv
@@ -624,7 +624,6 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
     from .clipboard import ClipboardSync, warn_sync
 
     validate_desktop_uid(config, os.getuid())
-    env_names = select_environment_names(config.environment, os.environ)
     options = list(app_args)
     if '--' in options:
         options = options[:options.index('--')]
@@ -636,7 +635,6 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
     desktop_seccomp = resolve_desktop_seccomp(config, runner, program_dir=program_dir, unsafe=unsafe)
     if desktop_seccomp is not None and config.docker_mode == 'sysbox':
         print('WARNING: Chromium seccomp with Sysbox has not been live-qualified.', file=sys.stderr)
-    mounts = prepare_mounts(config)
     if not os.environ.get('DISPLAY'):
         raise ValueError('Desktop requires a host DISPLAY')
     for tool in ('Xephyr', 'xauth', 'setxkbmap'):
@@ -651,7 +649,7 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
     # Restart uses the recorded teardown path, which also handles a dead
     # Xephyr. Loading first would reject the stale record before cleanup.
     runtime = None if restart else manager.load()
-    project = ComposeProject(config, paths, mounts, runner, program_dir=program_dir,
+    project = ComposeProject(config, paths, (), runner, program_dir=program_dir,
                              desktop_runtime=runtime, desktop_seccomp=desktop_seccomp)
     if restart:
         old_mode = project.state.read_mode()
@@ -678,6 +676,8 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
                   'restart or stop. Use desktop --restart to apply current host credentials, '
                   'keyboard settings and launch policy.')
             return 0
+    env_names, app_env = launch_environment(config.hooks, config.environment, os.environ)
+    project.mounts = prepare_mounts(config)
     if restart:
         project.ensure_inner_docker()
         if config.docker_mode == 'sysbox':
@@ -728,7 +728,7 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
             if not app_unsafe:
                 command.insert(1, '--no-sandbox')
         result = project.exec('claude-desktop', command, workdir=config.container.home,
-                              env_names=env_names, interactive=False, tty=False, detach=True,
+                              env_names=env_names, env=app_env, interactive=False, tty=False, detach=True,
                               capture_output=True)
         if result:
             sys.stderr.write(f'Claude Desktop launch failed (exit {result}); no retry was attempted.\n')

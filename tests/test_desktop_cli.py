@@ -76,7 +76,7 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         patch.dict(os.environ, {'DISPLAY': ':0', 'SECRET': 'do-not-leak-credential'}, clear=True).start()
         patch.object(desktop, 'resolve_host_paths', return_value=self.paths, create=True).start()
         patch.object(desktop, 'CommandRunner', return_value=self.runner, create=True).start()
-        patch.object(desktop.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name).start()
+        patch.object(desktop.shutil, 'which', side_effect=lambda name, **kwargs: '/usr/bin/' + name).start()
         patch.object(desktop.XephyrManager, 'load', return_value=None, create=True).start()
         self.start_xephyr = patch.object(
             desktop.XephyrManager, 'start', side_effect=lambda **kwargs: self.events.append('start') or self.runtime
@@ -728,14 +728,57 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         self.assertNotIn('/tmp/.X11-unix', [v['source'] for v in model['services']['claude-desktop']['volumes']])
         self.assertNotIn('DISPLAY', model['services']['claude-cli']['environment'])
 
-    def test_missing_environment_or_mount_fails_before_docker_or_display(self):
+    def test_missing_environment_or_mount_fails_before_container_or_display_changes(self):
         configs = (replace(self.config, environment=replace(self.config.environment, required=('MISSING',))),
                    replace(self.config, container=replace(self.config.container, mounts=(self.root / 'missing',))))
         for config in configs:
             with self.subTest(config=config), self.assertRaises(ValueError):
                 self.launch(config)
-            self.assertEqual(self.runner.calls, [])
+            self.assertTrue(all('ps' in argv for argv, _ in self.runner.calls))
             self.assertEqual(self.events, [])
+
+    def test_pre_launch_hook_runs_for_start_and_restart_but_not_reuse(self):
+        from claude_docker.model import HooksConfig
+
+        script = self.root / 'pre-launch.sh'
+        marker = self.root / 'prepared'
+        script.write_text(f'printf "%s\\n" called >> "{marker}"\nexport TOKEN=fresh\n')
+        config = replace(self.config, hooks=HooksConfig(script),
+                         environment=replace(self.config.environment, required=('TOKEN',)))
+        self.assertEqual(self.launch(config), 0)
+        self.assertEqual(marker.read_text(), 'called\n')
+        app = self.app_commands()[-1]
+        self.assertIn('TOKEN', app)
+        self.assertNotIn('fresh', app)
+        for argv, kwargs in self.runner.calls:
+            if argv == app:
+                self.assertEqual(kwargs['env']['TOKEN'], 'fresh')
+            else:
+                self.assertNotIn('TOKEN', kwargs.get('env') or {})
+        self.assertNotIn('TOKEN', os.environ)
+
+        script.unlink()
+        with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime):
+            self.assertEqual(self.launch(config), 0)
+        self.assertIn('already running', self.stdout.getvalue())
+        self.assertEqual(len(self.app_commands()), 1)
+        self.assertEqual(marker.read_text(), 'called\n')
+
+        script.write_text('exit 13\n')
+        self.runner.calls.clear()
+        self.events.clear()
+        with self.assertRaisesRegex(ValueError, r'hooks\.pre_launch'):
+            self.launch(config, restart=True)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.runner.calls, [])
+        self.assertTrue(self.runner.running)
+
+        script.write_text(f'printf "%s\\n" restarted >> "{marker}"\nexport TOKEN=refreshed\n')
+        self.assertEqual(self.launch(config, restart=True), 0)
+        self.assertEqual(marker.read_text(), 'called\nrestarted\n')
+        [app] = self.app_commands()
+        kwargs = next(kwargs for argv, kwargs in self.runner.calls if argv == app)
+        self.assertEqual(kwargs['env']['TOKEN'], 'refreshed')
 
     def test_different_uid_rejected_before_state_preparation_display_or_docker(self):
         config = replace(self.config, container=replace(self.config.container, uid=os.getuid() + 1))

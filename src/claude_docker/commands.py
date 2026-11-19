@@ -64,15 +64,41 @@ def _child_has_exited(pid: int) -> bool:
     return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
 
 
+@contextmanager
+def child_session(arguments: Sequence[str], **kwargs) -> Iterator[subprocess.Popen]:
+    """Own the process group until the caller finishes reading and reaps the leader."""
+    with subprocess.Popen(arguments, start_new_session=True, **kwargs) as process:
+        try:
+            yield process
+        except BaseException:
+            try:
+                _child_has_exited(process.pid)
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ChildProcessError, ProcessLookupError):
+                pass
+            raise
+
+
 def _collect_before_reap(process: subprocess.Popen[str], deadline: float,
-                         timeout: float, check_cancelled: Callable[[], None] | None) -> tuple[bytearray, bytearray]:
+                         timeout: float, check_cancelled: Callable[[], None] | None, *,
+                         extra_output: tuple[int, bytearray, int] | None = None) -> tuple[bytearray, bytearray]:
     # Drain the pipes without communicate(), which can reap the group leader
     # during an interrupt. An exited leader's PID stays reserved until wait().
     output, errors = bytearray(), bytearray()
 
+    def check_auxiliary_exit() -> None:
+        if extra_output is not None:
+            # A failed hook can leave descendants holding the protocol pipe.
+            # Observe its exit without reaping so group cleanup owns the PID.
+            status = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if status is not None and (status.si_code != os.CLD_EXITED or status.si_status):
+                code = status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+                raise subprocess.CalledProcessError(code, process.args)
+
     def remaining() -> float:
         if check_cancelled is not None:
             check_cancelled()
+        check_auxiliary_exit()
         seconds = deadline - time.monotonic()
         if seconds <= 0:
             raise subprocess.TimeoutExpired(process.args, timeout,
@@ -84,11 +110,18 @@ def _collect_before_reap(process: subprocess.Popen[str], deadline: float,
         for stream, buffer in ((process.stdout, output), (process.stderr, errors)):
             if stream is not None:
                 selector.register(stream, selectors.EVENT_READ, buffer)
+        if extra_output is not None:
+            fd, buffer, _ = extra_output
+            selector.register(fd, selectors.EVENT_READ, buffer)
         while selector.get_map():
             seconds = remaining()
-            for key, _ in selector.select(min(0.05, seconds) if check_cancelled is not None else seconds):
+            poll = 0.05 if check_cancelled is not None or extra_output is not None else 3600
+            for key, _ in selector.select(min(poll, seconds)):
                 chunk = os.read(key.fd, 65536)
                 if chunk:
+                    if (extra_output is not None and key.fd == extra_output[0]
+                            and len(key.data) + len(chunk) > extra_output[2]):
+                        raise BufferError('auxiliary subprocess output exceeds its size limit')
                     key.data.extend(chunk)
                 else:
                     selector.unregister(key.fileobj)
@@ -96,6 +129,7 @@ def _collect_before_reap(process: subprocess.Popen[str], deadline: float,
     while True:
         seconds = remaining()
         if _child_has_exited(process.pid):
+            check_auxiliary_exit()
             return output, errors
         time.sleep(min(0.05, seconds))
 
@@ -133,17 +167,8 @@ class CommandRunner:
         # A bounded command can spawn a transport such as ssh. Own its
         # process group so cancellation cannot strand the transport or hit peers.
         deadline = time.monotonic() + timeout
-        with subprocess.Popen(arguments, env=env, stdout=stdout, stderr=stderr,
-                              start_new_session=True, text=True) as process:
-            try:
-                output, errors = _collect_before_reap(process, deadline, timeout, check_cancelled)
-            except BaseException:
-                try:
-                    _child_has_exited(process.pid)
-                    os.killpg(process.pid, signal.SIGKILL)
-                except (ChildProcessError, ProcessLookupError):
-                    pass
-                raise
+        with child_session(arguments, env=env, stdout=stdout, stderr=stderr, text=True) as process:
+            output, errors = _collect_before_reap(process, deadline, timeout, check_cancelled)
             status = process.wait()
         result = subprocess.CompletedProcess(arguments, status, _decode_output(process.stdout, output),
                                              _decode_output(process.stderr, errors))

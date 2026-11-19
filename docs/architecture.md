@@ -16,7 +16,7 @@ The root `claude-docker` executable loads `src/claude_docker`. The main modules 
 | --- | --- |
 | `cli`, `commands`, `process` | Parse commands and run child processes |
 | `config`, `model`, `paths` | Validate configuration and resolve host paths |
-| `mounts`, `environment` | Prepare state mounts and select process variables |
+| `mounts`, `environment`, `hooks` | Prepare mounts and selected process variables; run host pre-launch Bash |
 | `compose`, `state` | Generate runtime overrides and track managed resources |
 | `desktop`, `clipboard`, `seccomp` | Manage the nested display and Desktop policy |
 | `installer`, `manifest`, `uninstall` | Install, verify, update, and remove program files |
@@ -52,6 +52,16 @@ present. Each new process receives the selected current host values. The launche
 does not put these values in generated Compose files or process arguments.
 Desktop must restart to receive refreshed values. Process environments remain
 readable to the application, the Docker daemon, and permitted process inspectors.
+
+An optional `[hooks].pre_launch` script is sourced in a separate host Bash
+process before a new CLI or Desktop process. The default timeout is 60 seconds.
+Exports travel through an anonymous NUL-delimited pipe, separate from script
+output. Only configured environment names can change in the app's Docker exec
+environment; launcher and Docker transport settings keep their original values.
+The launcher environment is not modified. The hook runs before mount preparation,
+so it can prepare files under configured mounts. Errors or timeouts abort launch
+before stopping an existing Desktop. Reusing Desktop skips the hook and credential
+validation. Build, check, help, and teardown do not run hooks.
 
 ## Images and Compose
 

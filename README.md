@@ -242,6 +242,54 @@ claude-docker desktop --restart
 Inner containers do not automatically inherit these variables. Pass each
 required variable explicitly when you start an inner container.
 
+### Prepare credentials and files before launch
+
+Set a trusted host Bash script in your configuration:
+
+```toml
+[hooks]
+pre_launch = "~/.config/claude-docker/pre-launch.sh"
+timeout_seconds = 60
+```
+
+Keep the AWS names in `[environment]` as shown above. Install the AWS CLI
+on the host and configure an identity that can request the federation token.
+Create `~/.config/claude-docker/pre-launch.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+credentials="$(
+  aws sts get-federation-token \
+    --name readonly \
+    --duration-seconds 43200 \
+    --policy-arns arn=arn:aws:iam::aws:policy/ReadOnlyAccess \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+    --output text
+)"
+read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+  <<< "$credentials"
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+unset credentials
+```
+
+The launcher sources the script in a separate Bash process, as your host user,
+from the directory where you called it. Shell startup files are not loaded.
+The script need not be executable. Omit `pre_launch` to disable the hook.
+The hook runs before each new CLI process and each Desktop start or restart.
+It does not run when Desktop is already running, or for build, check, and stop.
+Use `claude-docker desktop --restart` to refresh Desktop credentials.
+
+A script error or timeout stops the launch; an existing Desktop stays running.
+Only names in `[environment]` can receive hook exports or unsets. Host launcher
+and Docker transport settings retain their original values. The launcher does
+not save or print exported values. Script output is visible: do not print secrets
+or enable `set -x`. Run only scripts you trust.
+
+The script can also create or copy files before mounts are prepared. Put them
+inside configured workspace or state mounts so Claude can access them.
+
 ### Optional shell aliases
 
 After installation, add these lines to `~/.bashrc`:

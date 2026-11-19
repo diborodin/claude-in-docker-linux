@@ -8,7 +8,7 @@ import re
 import tomllib
 from typing import Any
 
-from .model import AppConfig, ContainerConfig, DesktopConfig, EnvironmentConfig, StateMountConfig
+from .model import AppConfig, ContainerConfig, DesktopConfig, EnvironmentConfig, HooksConfig, StateMountConfig
 from .paths import HostPaths
 
 
@@ -69,6 +69,11 @@ optional = []
 # AWS example: replace the empty required list above with:
 # required = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
 # optional = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+
+[hooks]
+# Optional trusted Bash script sourced on the host before each new Claude process.
+# pre_launch = "~/.config/claude-docker/pre-launch.sh"
+timeout_seconds = 60
 '''
 
 _SCHEMA = {
@@ -78,6 +83,7 @@ _SCHEMA = {
     "desktop": {"sandbox": "bool", "clipboard": "clipboard", "seccomp": "seccomp",
                 "keyboard_layout": "keyboard_layout", "keyboard_options": "keyboard_options"},
     "environment": {"required": "names", "optional": "names"},
+    "hooks": {"pre_launch": "path", "timeout_seconds": "positive_integer"},
 }
 _OVERRIDES = {
     "CLAUDE_DOCKER_MODE": ("docker_mode", "mode"),
@@ -131,6 +137,9 @@ def _validate(value: Any, kind: str, setting: str, home: Path) -> Any:
     elif kind == "id":
         if type(value) is not int or not 1 <= value <= 4294967294:
             raise _invalid(setting, "expected an integer in 1..4294967294", value)
+    elif kind == "positive_integer":
+        if type(value) is not int or value <= 0:
+            raise _invalid(setting, "expected a positive integer", value)
     elif kind in ("path", "container_home"):
         path = _path(value, setting, home)
         if kind == "container_home" and not os.path.normpath(str(path)).strip('/'):
@@ -217,6 +226,7 @@ def load_config(*, env: Mapping[str, str], paths: HostPaths, account: AccountInf
                     "keyboard_layout": DesktopConfig.keyboard_layout,
                     "keyboard_options": DesktopConfig.keyboard_options},
         "environment": {"required": [], "optional": []},
+        "hooks": {"timeout_seconds": HooksConfig.timeout_seconds},
     }
     values = {}
     selected = resolve_config_file(env=env, paths=paths, config_file=config_file)
@@ -273,6 +283,7 @@ def load_config(*, env: Mapping[str, str], paths: HostPaths, account: AccountInf
         state_desktop=StateMountConfig(values["state.desktop.source"], values["state.desktop.mount"]),
         desktop=DesktopConfig(**{key: values[f"desktop.{key}"] for key in _SCHEMA["desktop"]}),
         environment=EnvironmentConfig(values["environment.required"], values["environment.optional"]),
+        hooks=HooksConfig(values.get("hooks.pre_launch"), values["hooks.timeout_seconds"]),
     )
 
 
