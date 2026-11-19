@@ -1,18 +1,20 @@
 """Claude Code pin selection, publication and build integration."""
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from email.message import Message
+from http.client import HTTPResponse
 import io
 import json
 import os
 from pathlib import Path
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.response import addinfourl
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,12 +25,32 @@ from claude_docker.paths import resolve_host_paths
 
 
 class ReleaseResponse(io.BytesIO):
+    length = None
+    status = 200
+
     def __init__(self, body, url='https://downloads.claude.ai/claude-code-releases/latest'):
         super().__init__(body)
         self.url = url
 
     def geturl(self):
         return self.url
+
+
+def framed_response(headers, body, *, status=200):
+    class BoundedBody(io.BytesIO):
+        def read(self, size=-1):
+            if not 0 <= size <= 129:
+                raise AssertionError(f'Unbounded metadata response read: {size}')
+            return super().read(size)
+
+    class Socket:
+        def makefile(self, mode):
+            return BoundedBody(f'HTTP/1.1 {status} Fixture\r\n'.encode() + headers + b'\r\n' + body)
+
+    response = HTTPResponse(Socket())
+    response.url = 'https://downloads.claude.ai/claude-code-releases/latest'
+    response.begin()
+    return response
 
 
 class ClaudeVersionTests(unittest.TestCase):
@@ -54,16 +76,32 @@ class ClaudeVersionTests(unittest.TestCase):
         self.pin.parent.mkdir(parents=True, exist_ok=True)
         self.pin.write_bytes(value)
 
+    def run_metadata_worker(self, argv, **kwargs):
+        self.assertEqual(argv[0], sys.executable)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = self.version_api()._metadata_worker()
+        result = subprocess.CompletedProcess(argv, status, output.getvalue())
+        if kwargs.get('check', True):
+            result.check_returncode()
+        return result
+
     def build(self, arguments, response=None, *, fail=False, edit_after_cli=False):
+        if '--desktop' in arguments or '--all' in arguments:
+            self.pin.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.pin.with_name('claude-desktop.version').write_text('5.11492.5\n')
+
         def request(url, data=None, timeout=None):
             self.assertEqual(url, 'https://downloads.claude.ai/claude-code-releases/latest')
             self.assertGreater(timeout, 0)
             if isinstance(response, Exception):
                 raise response
             self.assertIsNotNone(response, 'Ordinary builds must not request metadata')
-            return response if isinstance(response, ReleaseResponse) else ReleaseResponse(response)
+            return ReleaseResponse(response) if isinstance(response, bytes) else response
 
         def run(runner, argv, **kwargs):
+            if argv[0] == sys.executable:
+                return self.run_metadata_worker(argv, **kwargs)
             service = argv[-1]
             index = argv.index('build')
             override = json.loads(Path(argv[index - 1]).read_text())
@@ -163,6 +201,98 @@ class ClaudeVersionTests(unittest.TestCase):
                 self.assertEqual(list(self.pin.parent.iterdir()), [self.pin])
                 self.assertFalse(self.builds)
 
+    def test_metadata_failures_report_safe_categories(self):
+        self.write_pin(b'2.2.0\n')
+        for error, diagnostic in (
+            (URLError(ssl.SSLCertVerificationError('private-tls-detail')), 'TLS certificate verification failed'),
+            (URLError(TimeoutError('private-timeout-detail')), 'request timed out'),
+            (ValueError('private-proxy-detail'), 'network request failed'),
+            (HTTPError('https://example.invalid/private-url', 503, 'private-reason', {}, None), 'HTTP status 503'),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.errors.seek(0)
+                self.errors.truncate()
+                self.assertEqual(self.build(['build', '--update-claude'], error), 1)
+                self.assertIn(diagnostic, self.errors.getvalue())
+                self.assertNotIn('private-', self.errors.getvalue())
+                self.assertEqual(self.pin.read_bytes(), b'2.2.0\n')
+                self.assertFalse(self.builds)
+
+    def test_incomplete_http_metadata_preserves_pin_and_prevents_build(self):
+        self.write_pin(b'2.2.0\n')
+        self.pin.chmod(0o640)
+        before = self.pin.stat()
+        for headers, body in (
+            (b'Content-Length: 13\r\n', b'2.3.4'),
+            (b'Content-Length: 512\r\n', b'2.3.4'),
+            (b'Transfer-Encoding: chunked\r\n', b'5\r\n2.3.4\r\n'),
+        ):
+            with self.subTest(headers=headers):
+                self.errors.seek(0)
+                self.errors.truncate()
+                with framed_response(headers, body) as response:
+                    self.assertEqual(self.build(['build', '--update-claude'], response),
+                                     1, self.errors.getvalue())
+                self.assertIn('incomplete HTTP response', self.errors.getvalue())
+                self.assertNotIn('2.3.4', self.errors.getvalue())
+                self.assertFalse(self.builds)
+                after = self.pin.stat()
+                self.assertEqual((after.st_ino, after.st_mode, after.st_mtime_ns),
+                                 (before.st_ino, before.st_mode, before.st_mtime_ns))
+                self.assertEqual(self.pin.read_bytes(), b'2.2.0\n')
+
+    def test_complete_http_metadata_accepts_fixed_streamed_and_chunked_bodies(self):
+        version_api = self.version_api()
+        for headers, body in (
+            (b'Content-Length: 128\r\n', b'2.3.4' + b' ' * 123),
+            (b'', b'2.3.4'),
+            (b'Transfer-Encoding: chunked\r\nContent-Length: 12\r\n',
+             b'2\r\n2.\r\n3\r\n3.4\r\n0\r\n\r\n'),
+        ):
+            with self.subTest(headers=headers), framed_response(headers, body) as response, \
+                    patch('urllib.request.OpenerDirector.open', return_value=response), redirect_stderr(self.errors):
+                self.assertEqual(version_api._fetch_latest_version(), '2.3.4')
+
+    def test_other_success_statuses_are_rejected_before_reading_metadata(self):
+        version_api = self.version_api()
+        for status in (206, 201, 202, 204):
+            with self.subTest(status=status), framed_response(b'Content-Length: 5\r\n', b'2.3.4',
+                                                               status=status) as response, \
+                    patch('urllib.request.OpenerDirector.open', return_value=response), \
+                    patch.object(response, 'read', wraps=response.read) as read, redirect_stderr(self.errors):
+                with self.assertRaisesRegex(ValueError, f'HTTP status {status}'):
+                    version_api._fetch_latest_version()
+                read.assert_not_called()
+
+    def test_partial_http_metadata_preserves_pin_and_prevents_build(self):
+        self.write_pin(b' \t2.2.0\r\n')
+        self.pin.chmod(0o640)
+        before = self.pin.stat()
+        with framed_response(b'Content-Length: 5\r\nContent-Range: bytes 0-4/10\r\n', b'2.3.4',
+                             status=206) as response:
+            self.assertEqual(self.build(['build', '--update-claude'], response), 1, self.errors.getvalue())
+        self.assertIn('HTTP status 206', self.errors.getvalue())
+        self.assertFalse(self.builds)
+        after = self.pin.stat()
+        self.assertEqual((after.st_ino, after.st_mode, after.st_mtime_ns),
+                         (before.st_ino, before.st_mode, before.st_mtime_ns))
+        self.assertEqual(self.pin.read_bytes(), b' \t2.2.0\r\n')
+
+    def test_partial_http_metadata_does_not_create_first_pin_or_build(self):
+        with framed_response(b'Content-Length: 5\r\nContent-Range: bytes 0-4/10\r\n', b'2.3.4',
+                             status=206) as response:
+            self.assertEqual(self.build(['build'], response), 1, self.errors.getvalue())
+        self.assertIn('HTTP status 206', self.errors.getvalue())
+        self.assertFalse(self.pin.parent.exists())
+        self.assertFalse(self.builds)
+
+    def test_oversized_http_metadata_stays_bounded(self):
+        version_api = self.version_api()
+        with framed_response(b'Content-Length: 512\r\n', b'2.3.4' + b' ' * 507) as response, \
+                patch('urllib.request.OpenerDirector.open', return_value=response), redirect_stderr(self.errors):
+            with self.assertRaisesRegex(ValueError, 'Invalid Claude Code version'):
+                version_api._fetch_latest_version()
+
     def test_metadata_redirect_to_http_is_rejected(self):
         self.write_pin(b'2.2.0\n')
         response = ReleaseResponse(b'2.3.0', 'http://untrusted.test/latest')
@@ -194,10 +324,9 @@ class ClaudeVersionTests(unittest.TestCase):
 
         with patch('urllib.request._opener', None), patch('urllib.request.HTTPSHandler.https_open', https), \
                 patch('urllib.request.HTTPHandler.http_open', http):
-            with self.assertRaisesRegex(ValueError, 'Cannot fetch'):
-                version_api.update_code_version(ROOT, self.paths)
+            with self.assertRaisesRegex(ValueError, 'redirect refused'):
+                version_api._fetch_latest_version()
         self.assertEqual(calls, ['https://downloads.claude.ai/claude-code-releases/latest'])
-        self.assertFalse(self.pin.exists())
 
     def test_metadata_rejects_https_redirect_without_reading_its_body(self):
         class RedirectBody(io.BytesIO):
@@ -213,14 +342,13 @@ class ClaudeVersionTests(unittest.TestCase):
             response.msg = 'private-redirect'
             with patch.dict(os.environ, self.env, clear=True), redirect_stderr(self.errors), \
                     patch('urllib.request.HTTPSHandler.https_open', return_value=response) as https, \
-                    patch.object(cli.CommandRunner, 'run') as docker:
+                    patch.object(cli.CommandRunner, 'run', side_effect=self.run_metadata_worker):
                 self.assertEqual(cli.main(['build', '--update-claude']), 1)
             self.assertTrue(body.closed)
         self.assertEqual([call.args[0].full_url for call in https.call_args_list], [url])
-        self.assertIn('Cannot fetch the latest Claude Code version', self.errors.getvalue())
+        self.assertIn('redirect refused', self.errors.getvalue())
         self.assertNotIn('private-redirect', self.errors.getvalue())
         self.assertEqual(self.pin.read_bytes(), b'2.2.0\n')
-        docker.assert_not_called()
 
     def test_config_alias_cannot_publish_a_pin_in_a_checkout_or_installed_bundle(self):
         from claude_docker.installer import InstallLayout, install_release
@@ -230,8 +358,8 @@ class ClaudeVersionTests(unittest.TestCase):
         (checkout / 'image').mkdir(parents=True)
         (checkout / 'image/claude-code.version').write_bytes(b'2.1.326\n')
         layout = InstallLayout.user(self.env)
-        install_release(ROOT, layout, version='0.3.7')
-        installed = layout.release_dir('0.3.7')
+        install_release(ROOT, layout, version='0.4.0')
+        installed = layout.release_dir('0.4.0')
         self.pin.parent.parent.mkdir(parents=True)
         for program in (checkout, installed):
             with self.subTest(program=program):
@@ -240,7 +368,7 @@ class ClaudeVersionTests(unittest.TestCase):
                 for target in (program / 'image', program):
                     self.pin.parent.symlink_to(target)
                     try:
-                        with patch('urllib.request.OpenerDirector.open', return_value=ReleaseResponse(b'2.2.3')) as fetch:
+                        with patch.object(version_api, '_latest_version', return_value='2.2.3') as fetch:
                             with self.assertRaisesRegex(ValueError, 'program'):
                                 version_api.update_code_version(program, self.paths)
                             if target == program:
@@ -258,18 +386,18 @@ class ClaudeVersionTests(unittest.TestCase):
 
         def edit_pin(*args, **kwargs):
             self.pin.write_bytes(b'2.2.0\n')
-            return ReleaseResponse(b'2.2.0')
+            return '2.2.0'
 
-        with patch('urllib.request.OpenerDirector.open', side_effect=edit_pin):
+        with patch.object(version_api, '_latest_version', side_effect=edit_pin):
             with self.assertRaisesRegex(ValueError, 'changed'):
                 version_api.update_code_version(ROOT, self.paths)
         self.assertEqual(self.pin.read_bytes(), b'2.2.0\n')
 
         def move_directory(*args, **kwargs):
             self.pin.parent.rename(self.root / 'moved-config')
-            return ReleaseResponse(b'2.2.0')
+            return '2.2.0'
 
-        with patch('urllib.request.OpenerDirector.open', side_effect=move_directory):
+        with patch.object(version_api, '_latest_version', side_effect=move_directory):
             with self.assertRaisesRegex(ValueError, 'changed'):
                 version_api.update_code_version(ROOT, self.paths)
         self.assertEqual((self.root / 'moved-config' / self.pin.name).read_bytes(), b'2.2.0\n')
@@ -342,9 +470,9 @@ class ClaudeVersionTests(unittest.TestCase):
 
                 def request(*args, **kwargs):
                     self.write_pin(b'2.3.0\n')
-                    return ReleaseResponse(b'2.2.1\n')
+                    return '2.2.1'
 
-                with patch('urllib.request.OpenerDirector.open', side_effect=request):
+                with patch.object(version_api, '_latest_version', side_effect=request):
                     with self.assertRaisesRegex(ValueError, 'changed'):
                         version_api.update_code_version(ROOT, self.paths)
                 self.assertEqual(self.pin.read_bytes(), b'2.3.0\n')
@@ -353,7 +481,7 @@ class ClaudeVersionTests(unittest.TestCase):
     def test_failed_atomic_publish_retains_previous_pin_and_cleans_draft(self):
         version_api = self.version_api()
         self.write_pin(b'2.2.0\n')
-        with patch('urllib.request.OpenerDirector.open', return_value=ReleaseResponse(b'2.2.1\n')), \
+        with patch.object(version_api, '_latest_version', return_value='2.2.1'), \
                 patch('os.replace', side_effect=OSError('injected publication failure')):
             with self.assertRaisesRegex((ValueError, OSError), 'publish|publication'):
                 version_api.update_code_version(ROOT, self.paths)
@@ -373,9 +501,9 @@ class ClaudeVersionTests(unittest.TestCase):
         def request(*args, **kwargs):
             config.unlink()
             config.symlink_to(other)
-            return ReleaseResponse(b'2.2.1')
+            return '2.2.1'
 
-        with patch('urllib.request.OpenerDirector.open', side_effect=request):
+        with patch.object(version_api, '_latest_version', side_effect=request):
             with self.assertRaisesRegex(ValueError, 'changed'):
                 version_api.update_code_version(ROOT, self.paths)
         self.assertFalse((original / self.pin.name).exists())

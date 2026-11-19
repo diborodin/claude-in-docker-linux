@@ -57,9 +57,10 @@ readable to the application, the Docker daemon, and permitted process inspectors
 
 Both products use Ubuntu 26.04. The `common` stage provides the mirrored account,
 Docker client tools, and the image tool manager. The `cli` stage adds
-configured development tools. The `desktop-runtime` stage adds the
-Desktop package and graphical dependencies; the `desktop` target adds development
-tools. The CLI image does not inherit the Desktop stage.
+configured development tools. The `desktop-runtime` stage adds the graphical
+dependencies. The `desktop` target adds development tools, runs customization,
+then installs the exact Desktop package. The CLI image does not use either
+Desktop stage.
 
 The independent `claude-code` stage downloads the selected native Linux
 binary and verifies its platform SHA-256 against the exact release manifest.
@@ -72,11 +73,41 @@ download and final copy, so `build` can reuse package, tool, and hook layers.
 The first launcher build resolves the latest official release and saves its
 exact version in the user's XDG configuration directory. Later builds use
 that pin. `build --update-claude` and `rebuild --update-claude` check the release
-once and keep a newer saved version. One private context contains the exact
-selected version for both targets. The pin survives a Docker failure,
-uninstall, and purge. Raw Docker builds use the shipped `latest` policy
+once and keep a newer saved version. A local Python worker requests the official
+latest metadata over verified HTTPS. It accepts only a complete HTTP 200
+response with a valid numeric version and rejects redirects. The worker sends
+validated failure categories to the parent, which reports each error once.
+The launcher reports progress on stderr and enforces a 30-second deadline that covers DNS, connection,
+and response reads. Each socket operation has a 10-second timeout. Saved pins
+bypass the worker. Timeout, cancellation, and metadata errors preserve the
+previous pin and prevent the build. Binary downloads during the image build
+have separate limits.
+
+One private context contains the exact selected version for both targets.
+The pin survives a Docker failure, uninstall, and purge. Raw Docker builds
+use the shipped `latest` policy
 in `image/claude-code.version`. They resolve it when the artifact layer
 runs, which can be skipped on a Docker cache hit.
+
+For Desktop targets, the first launcher build or an explicit `--update-desktop`
+runs a temporary container on the selected Docker daemon to resolve the native
+signed Anthropic apt candidate. The daemon caches an Ubuntu helper keyed by its
+recipe, script, and architecture. The helper and Desktop package stage copy the
+public CA bundle from the existing mise image and use Ubuntu's built-in apt over
+verified HTTPS. No Ubuntu package indexes are downloaded for resolution.
+Each lookup fetches the signing key and signed index into fresh storage. The launcher streams progress to stderr and reads only the version from
+stdout. Both resolvers own their subprocess groups and defer default
+cancellation until cleanup. Docker operations share a 300-second deadline,
+with up to 10 seconds to remove the invocation's container. The
+launcher stores the version in `claude-desktop.version` beside the Code pin and
+snapshots it for the selected build. The independent `claude-desktop-package`
+stage downloads exactly that version from the signed stable index, checks its
+identity and architecture, and passes the archive to a late networkless `dpkg`
+step through a read-only mount.
+The runtime layer declares all required Debian dependencies. A new unmet
+dependency fails the build with diagnostics from dpkg. Normal builds reuse the
+saved selection and the earlier runtime, tool, and customization layers when
+only Desktop changes. The raw Docker policy also supports `latest`.
 
 The shipped `image/mise.toml`, `image/mise.lock`, and `image/customize.sh` define
 the baseline. Apt installs ripgrep, jq, shellcheck, shfmt, sd, miller, hyperfine,
@@ -141,6 +172,22 @@ cache verifies the baseline, derivation and provenance on reuse. Desktop launch
 uses a new cache key for this resolution scheme. Keep the real cache path free of
 symlink ancestors. Desktop compares the requested policy with the running container before reuse.
 
+## Nested Desktop display
+
+Xephyr enables window resizing and disables RANDR so that core X11 geometry
+changes reach the application. The default keyboard layouts are `us,ru`, with
+`grp:alt_shift_toggle` to switch layouts inside the nested display. These settings
+do not change the host keyboard layout.
+
+Set `keyboard_layout` and `keyboard_options` in `[desktop]`, or use
+`CLAUDE_DESKTOP_KEYBOARD_LAYOUT` and `CLAUDE_DESKTOP_KEYBOARD_OPTIONS`, to override
+the defaults. `desktop --restart` applies changed settings. Reusing a running
+Desktop keeps its current keyboard state.
+
+Startup applies the keymap before publishing reusable runtime state. Xephyr
+verification tolerates individual file descriptors that close during inspection,
+while still requiring the recorded process to own the display listener socket.
+
 ## Installation and removal
 
 The `install` entry point supports user-local releases, a development link, and
@@ -171,3 +218,9 @@ Live Docker, Sysbox, and Desktop tests require explicit environment flags. Keep
 these flags unset for the normal suite. See [Desktop security](desktop-security.md)
 for the opt-in seccomp test and its limits. Documentation and local development
 records are excluded from installed bundles and image build inputs.
+
+Disposable-container checks verified that the application follows Xephyr window
+size changes. Real image builds verified reuse of user mise and customization
+layers when only the selected Claude versions changed. These checks used a warm
+build cache; they are not cold-build benchmarks. Physical keyboard switching,
+host-specific GUI behavior, and broader Sysbox qualification remain manual checks.

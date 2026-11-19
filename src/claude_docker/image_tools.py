@@ -11,11 +11,11 @@ import tempfile
 from .claude_version import read_code_version, update_code_version
 from .commands import CommandRunner, docker_environment
 from .customize import read_user_customize, user_customize_path
+from .desktop_version import select_desktop_version
 from .paths import HostPaths
-from .tool_config import (ToolProfile, _regular_bytes, read_user_tools,
+from .tool_config import (MISE_IMAGE, ToolProfile, _regular_bytes, read_user_tools,
                           validate_declarations, validate_distinct_tool_paths, validate_lock)
 
-MISE_IMAGE = 'jdxcode/mise:2026.11.5'
 POLICY = b'\n[settings]\nlockfile = true\nlocked_require_checksum = true\n'
 
 
@@ -95,12 +95,17 @@ def lock_image_tools(program_dir: Path, paths: HostPaths, runner: CommandRunner,
 
 @contextmanager
 def image_build_inputs(program_dir: Path, paths: HostPaths, env: Mapping[str, str], *,
-                       update_claude: bool = False):
+                       runner: CommandRunner | None = None, include_desktop: bool = False,
+                       update_claude: bool = False, update_desktop: bool = False):
     """Snapshot only validated, exact image inputs; never send a host directory."""
     profile = read_user_tools(paths, env, require_lock=True)
     customize = read_user_customize(paths)
     baseline = {}
-    for name in ('Dockerfile', '.dockerignore', 'image/mise.toml', 'image/mise.lock', 'image/customize.sh'):
+    names = ('Dockerfile', '.dockerignore', 'image/mise.toml', 'image/mise.lock', 'image/customize.sh')
+    desktop_apt = 'image/claude-desktop-apt.sh'
+    if include_desktop:
+        names += (desktop_apt,)
+    for name in names:
         raw = _regular_bytes(program_dir / name, lock=name.endswith('.lock'))
         if raw is None:
             raise ValueError(f'Missing image build input: {program_dir / name}')
@@ -111,6 +116,11 @@ def image_build_inputs(program_dir: Path, paths: HostPaths, env: Mapping[str, st
     version = select_version(program_dir, paths)
     baseline['image/claude-code.version'] = f'{version}\n'.encode('ascii')
     print(f'claude-docker: Claude Code version: {version}', file=sys.stderr)
+    if include_desktop:
+        version = select_desktop_version(program_dir, paths, runner if runner is not None else CommandRunner(),
+                                         env, apt_script=baseline[desktop_apt], refresh=update_desktop)
+        baseline['image/claude-desktop.version'] = f'{version}\n'.encode('ascii')
+        print(f'claude-docker: Claude Desktop version: {version}', file=sys.stderr)
     if profile is not None:
         print(f'claude-docker: tools: {profile.source}', file=sys.stderr)
     else:

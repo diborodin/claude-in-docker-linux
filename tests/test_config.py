@@ -58,6 +58,41 @@ class ConfigTests(unittest.TestCase):
                     self.load('', {'CLAUDE_DESKTOP_SECCOMP': value})
                 self.assertNotIn('credential-sentinel', str(caught.exception))
 
+    def test_desktop_keyboard_defaults(self):
+        desktop = self.load().desktop
+        self.assertEqual(desktop.keyboard_layout, 'us,ru')
+        self.assertEqual(desktop.keyboard_options, 'grp:alt_shift_toggle')
+
+    def test_desktop_keyboard_process_overrides_toml(self):
+        text = '[desktop]\nkeyboard_layout = "de,gb"\nkeyboard_options = "grp:win_space_toggle,ctrl:nocaps"'
+        desktop = self.load(text).desktop
+        self.assertEqual(desktop.keyboard_layout, 'de,gb')
+        self.assertEqual(desktop.keyboard_options, 'grp:win_space_toggle,ctrl:nocaps')
+        desktop = self.load(text, {'CLAUDE_DESKTOP_KEYBOARD_LAYOUT': 'gb',
+                                   'CLAUDE_DESKTOP_KEYBOARD_OPTIONS': ''}).desktop
+        self.assertEqual(desktop.keyboard_layout, 'gb')
+        self.assertEqual(desktop.keyboard_options, '')
+        self.assertEqual(self.load('[desktop]\nkeyboard_options = ""').desktop.keyboard_options, '')
+
+    def test_desktop_keyboard_rejects_unbounded_or_unsafe_xkb_arguments(self):
+        for field, values in (
+                ('keyboard_layout', ('', 'us,', 'us, ru', 'us,de,gb,ru,fr', '-option', 'us+ru',
+                                     'us(/tmp/credential-sentinel)', 'a' * 33, 'é', 1)),
+                ('keyboard_options', (',', 'grp:', 'grp:alt_shift_toggle,', '-print',
+                                      'grp:alt_shift_toggle;credential-sentinel', 'x' * 1025, True))):
+            name = 'CLAUDE_DESKTOP_' + field.upper()
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    literal = '"' + value + '"' if isinstance(value, str) else str(value).lower()
+                    with self.assertRaisesRegex(ValueError, 'desktop\\.' + field) as caught:
+                        self.load('[desktop]\n' + field + ' = ' + literal)
+                    self.assertNotIn('credential-sentinel', str(caught.exception))
+                    with self.assertRaisesRegex(ValueError, name) as caught:
+                        self.load('', {name: value})
+                    self.assertNotIn('credential-sentinel', str(caught.exception))
+            with self.assertRaisesRegex(ValueError, name):
+                self.load('', {name: 'valid\n-option'})
+
     def test_detected_defaults_use_invoking_home_and_do_not_create_state(self):
         config = self.load()
         self.assertEqual((config.container.user, config.container.uid, config.container.gid),

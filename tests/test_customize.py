@@ -103,6 +103,7 @@ class CustomizeTests(unittest.TestCase):
         self.hook.parent.mkdir(parents=True)
         self.hook.symlink_to(actual)
         self.hook.with_name('claude-code.version').write_text('2.1.326\n')
+        self.hook.with_name('claude-desktop.version').write_text('5.11492.5\n')
         (self.hook.parent / 'private-token').write_text('must stay on host')
         contexts = []
         overrides = []
@@ -119,7 +120,8 @@ class CustomizeTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(context.stat().st_mode), 0o700)
             self.assertEqual({str(path.relative_to(context)) for path in context.rglob('*') if path.is_file()},
                              {'Dockerfile', '.dockerignore', 'image/mise.toml', 'image/mise.lock',
-                              'image/customize.sh', 'image/customize-user.sh', 'image/claude-code.version'})
+                              'image/customize.sh', 'image/customize-user.sh', 'image/claude-code.version',
+                              'image/claude-desktop.version', 'image/claude-desktop-apt.sh'})
             snapshot = context / 'image/customize-user.sh'
             self.assertFalse(snapshot.is_symlink())
             self.assertEqual(snapshot.read_bytes(), original)

@@ -270,10 +270,8 @@ For clipboard transfers, also install xclip. On Debian or Ubuntu:
 sudo apt install xserver-xephyr xauth x11-xkb-utils xclip
 ```
 
-The configured container UID must match the host UID for private X11 access.
-CLI identity overrides with a different UID cannot be used for Desktop.
-If the host Desktop app uses the shared Claude profile, close it first.
-A shared Desktop profile can cause profile locking and concurrent-write errors.
+The container UID must match the host UID for private X11 access. Close any host
+Claude app using the shared profile to avoid locks and concurrent writes.
 
 1. Build the Desktop image:
 
@@ -293,6 +291,13 @@ A shared Desktop profile can cause profile locking and concurrent-write errors.
    claude-docker desktop
    ```
 
+Resize the Xephyr window to resize Claude. Alt+Shift switches between US and
+Russian inside Xephyr. Set `keyboard_layout` and `keyboard_options` in `[desktop]`
+to use up to four comma-separated XKB layouts and comma-separated XKB options.
+An empty option string clears the options. `CLAUDE_DESKTOP_KEYBOARD_LAYOUT` and
+`CLAUDE_DESKTOP_KEYBOARD_OPTIONS` override TOML. Run `claude-docker desktop --restart`
+to apply changes to a running session.
+
 The default setting is `seccomp = "default"` in `[desktop]`. It preserves
 Docker policy. To request the Chromium policy, set this in TOML:
 
@@ -311,12 +316,7 @@ cache entry automatically. Resolution errors stop launch with no automatic fallb
 Four exact kernel namespace operations expand the kernel attack surface. Keep the internal sandbox enabled. Use `claude-docker desktop --restart`
 when the running profile differs. Restart clears stale Xephyr state and recreates only Desktop; it requires an unchanged Docker mode with no pending transition. Xephyr disables MIT-SHM to keep container IPC private. Live Sysbox remains unqualified.
 
-On Docker 29.10.0, the unwrapped launcher applied the Moby v0.3.0 baseline plus four rules. Authenticated Xephyr displayed a Claude window.
-Three renderers had separate user/PID namespaces, zero capabilities, NoNewPrivs and two seccomp filters.
-The main and GPU processes stayed stable for 20 seconds, and normal stop cleaned up the session.
-Renderer evidence does not certify the internal GPU sandbox: an additional
-GPU filter was not established. Login, real profiles, host clipboard,
-other daemon versions, arm64 and live Sysbox remain unqualified.
+See the [Desktop security notes](docs/desktop-security.md) for renderer results and why the GPU sandbox remains unqualified.
 
 The default clipboard mode is manual. To copy the host clipboard into
 Desktop, run:
@@ -426,45 +426,45 @@ sandbox, interactive Desktop, or a complete nested Docker workload.
 
 ## Update or uninstall
 
-To update, obtain a newer trusted release. From its extracted directory,
-run `./install` again. The installer verifies owned files before replacement.
-It retains configuration and user data. Do not edit installed bundles;
-they are immutable.
+Run `./install` from a newer trusted release to update the launcher.
+For changed sources with the same version, run `claude-docker uninstall`
+without `--purge`, then run `./install`. The installer verifies immutable
+bundles. Both workflows retain user configuration, state, and build inputs.
 
-To refresh the CLI image with current base images and no build cache, run:
-
-```bash
-claude-docker rebuild
-```
-
-Use `--desktop` for the Desktop image or `--all` for both images.
-After a build or rebuild, stop existing containers before the next start:
-
-```bash
-claude-docker stop
-```
-
-### Update Claude Code
+### Update Claude Code or Desktop
 
 ```bash
 claude-docker build --update-claude
+claude-docker build --update-desktop
+claude-docker build --all --update-claude --update-desktop
 ```
 
-The first build checks for the latest Claude Code release and saves its exact
-version in `~/.config/claude-docker/claude-code.version`. `XDG_CONFIG_HOME`
-changes this location. Later builds use the saved version. Use
-`--update-claude` to check again. Add `--all` for both images or `--desktop`
-for the Desktop image only. The launcher rejects redirects during this check
-and keeps a newer saved version. Raw Docker builds resolve the shipped
-`latest` policy when the artifact layer runs.
+`build` defaults to CLI only. `--desktop` or `--update-desktop` selects Desktop,
+and `--all` builds both. The first build pins the latest release for each
+selected image. The update flags refresh their own pins, and Code keeps a newer
+saved version. Both pins live in `~/.config/claude-docker/` as `claude-code.version`
+and `claude-desktop.version`. `XDG_CONFIG_HOME` changes the base directory.
+Install, uninstall, and purge retain both pins. Saved pins skip version lookups.
 
-The version is saved before Docker builds. If the build fails, retry with
-`build` and the same target option (`--desktop` or `--all`, if used).
-Omit `--update-claude`. Install, uninstall, and purge keep the saved version.
-After a version-only change, `build` can reuse the package, tool, and hook layers.
-`rebuild --update-claude` uses fresh base images and skips the cache.
-Automatic and manual Code updates are disabled in the containers. Run
-`claude-docker stop`, then start Claude to use the new image.
+Both lookups show progress on stderr and keep the old pin on failure.
+Code reads official HTTPS release metadata using Python and requires HTTP 200.
+The lookup has a 30-second limit and needs no Docker or extra host tools.
+Desktop fetches fresh signed Anthropic apt metadata without Ubuntu package
+indexes. The selected Docker daemon caches a small Ubuntu helper for its native
+architecture. Preparing it can pull the Ubuntu and mise images. The daemon
+rebuilds it when its inputs change or it is removed. Desktop has a five-minute
+lookup limit plus ten seconds for cleanup. Its helper survives uninstall and
+purge. Image downloads have separate transfer limits.
+To retry a build with saved versions, keep the target and omit the update flags.
+
+A version-only `build` can reuse system packages, tools, and customization
+layers. `claude-docker rebuild` uses the same flags with fresh base images
+and no cache. A raw Docker build uses the shipped `latest` policies when the
+artifact layers run. Code updates inside the containers are disabled.
+
+Run `claude-docker stop` before starting Code from the new image.
+Run `claude-docker desktop --restart` to use a rebuilt Desktop image with
+your existing profile.
 
 ### Add image tools and packages
 
@@ -597,7 +597,7 @@ claude-docker customize init
 
 Edit `~/.config/claude-docker/customize.sh`. `XDG_CONFIG_HOME` changes the
 default directory. The script runs as root after tool setup in each image
-build, before the image contains Claude Code. The example installs to
+build, before the Claude artifacts are installed. The example installs to
 `/usr/local/bin`, outside mounted HOME.
 Run `claude-docker build --all`, run `claude-docker stop`, then start Claude.
 Artifact locks apply to the mise profile. Keep secrets out of your script.
@@ -665,7 +665,6 @@ before you retry.
 
 The following work is not complete. Items are listed in the proposed order.
 
-- [ ] Pin the Claude Desktop application package and document how to update it.
 - [ ] Add CI for unit tests, image builds, and release archive checksums.
 - [ ] Complete interactive CLI checks on Debian 13 and Ubuntu 24.04.
   Build and test the arm64 images.

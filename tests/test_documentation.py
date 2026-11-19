@@ -57,11 +57,11 @@ class DocumentationTests(unittest.TestCase):
                    'compose', 'config', 'desktop', 'environment', 'installer', 'manifest',
                    'model', 'mounts', 'paths', 'process', 'seccomp', 'seccomp_source', 'seccomp_cache', 'seccomp_profile',
                    'state', 'uninstall', 'tool_config', 'image_tools',
-                   'customize', 'claude_version'}
+                   'customize', 'claude_version', 'desktop_resolver', 'desktop_version', 'version_pin'}
         expected = {'.dockerignore', 'claude-docker', 'install', 'VERSION', 'README.md', 'LICENSE',
                     'Dockerfile', 'compose.yaml', 'compose.sysbox.yaml', 'config.example.toml',
                     'image/customize.sh', 'image/customize.example.sh', 'image/mise.lock', 'image/mise.toml',
-                    'image/claude-code.version',
+                    'image/claude-code.version', 'image/claude-desktop.version', 'image/claude-desktop-apt.sh',
                     'security/LICENSE.moby-profiles', 'security/NOTICE.moby-profiles'}
         expected |= {f'src/claude_docker/{module}.py' for module in modules}
         manifest, inputs = installer._source_manifest(ROOT, 'user', __version__)
@@ -84,7 +84,7 @@ class DocumentationTests(unittest.TestCase):
     def test_version_matches_package_and_executable_from_unrelated_directory(self):
         version = (ROOT / 'VERSION').read_text().strip()
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$')
-        self.assertEqual(version, '0.3.7')
+        self.assertEqual(version, '0.4.0')
         self.assertEqual(__version__, version)
         with tempfile.TemporaryDirectory() as directory:
             env = {'HOME': directory, 'PATH': '', 'PYTHONDONTWRITEBYTECODE': '1'}
@@ -340,7 +340,8 @@ class DocumentationTests(unittest.TestCase):
         self.assertCountEqual(patterns[1:], ['!Dockerfile', '!image/mise.toml',
                                              '!image/mise.lock', '!image/customize.sh',
                                              '!image/mise-user.toml', '!image/mise-user.lock',
-                                             '!image/customize-user.sh', '!image/claude-code.version'])
+                                             '!image/customize-user.sh', '!image/claude-code.version',
+                                             '!image/claude-desktop.version', '!image/claude-desktop-apt.sh'])
 
     def test_repository_file_references_exist(self):
         references = set(re.findall(r'\]\(([^)]+)\)', self.text))

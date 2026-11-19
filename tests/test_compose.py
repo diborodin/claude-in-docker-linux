@@ -186,6 +186,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         profile.parent.mkdir(parents=True)
         profile.write_text('[bootstrap.packages]\n"apt:ripgrep"="latest"')
         self.seed_code_version(profile.parent)
+        (profile.parent / 'claude-desktop.version').write_text('5.11492.5\n')
         contexts = []
         def run(argv, **kwargs):
             override = Path(argv[argv.index('-f', argv.index('-f') + 1) + 1])
@@ -549,7 +550,9 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         self.assertTrue(all(str(ROOT / 'compose.yaml') in cmd for cmd in commands))
 
     def test_cli_build_targets_require_explicit_desktop_or_all_selection(self):
-        self.seed_code_version(self.home / '.config/claude-docker')
+        config_dir = self.home / '.config/claude-docker'
+        self.seed_code_version(config_dir)
+        (config_dir / 'claude-desktop.version').write_text('5.11492.5\n')
         for operation in ('build', 'rebuild'):
             for options, expected in (([], ['claude-cli']),
                                       (['--desktop'], ['claude-desktop']),

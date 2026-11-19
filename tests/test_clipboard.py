@@ -298,7 +298,8 @@ class ClipboardModeTests(ComposeFixture, unittest.TestCase):
         patch.object(desktop, 'CommandRunner', return_value=self.runner).start()
         patch.object(desktop.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name).start()
         patch.object(desktop.XephyrManager, 'load', return_value=None).start()
-        patch.object(desktop.XephyrManager, 'start', side_effect=lambda: self.events.append('start') or self.runtime).start()
+        patch.object(desktop.XephyrManager, 'start',
+                     side_effect=lambda **kwargs: self.events.append('start') or self.runtime).start()
         patch.object(desktop.XephyrManager, 'stop', side_effect=lambda runtime: self.events.append('stop')).start()
         patch.object(desktop.XephyrManager, 'stop_recorded', side_effect=lambda **kwargs: self.events.append('stop')).start()
         patch.object(desktop.time, 'sleep').start()

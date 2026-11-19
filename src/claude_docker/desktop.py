@@ -20,7 +20,7 @@ import time
 from .commands import CommandRunner
 from .compose import ComposeProject, validate_desktop_uid
 from .environment import select_environment_names
-from .model import AppConfig, DesktopRuntime, ProcessIdentity
+from .model import AppConfig, DesktopConfig, DesktopRuntime, ProcessIdentity
 from .mounts import prepare_mounts
 from .process import docker_exec_argv
 from .paths import (HostPaths, _private_runtime, desktop_socket_dir, resolve_host_paths,
@@ -137,7 +137,13 @@ class XephyrManager:
             if not stat.S_ISSOCK(before.st_mode):
                 return None
             directory = _PROC_ROOT / str(identity.pid)
-            descriptors = {os.readlink(entry) for entry in (directory / 'fd').iterdir()}
+            descriptors = set()
+            for entry in (directory / 'fd').iterdir():
+                try:
+                    descriptors.add(os.readlink(entry))
+                except FileNotFoundError:
+                    # A descriptor can close between enumeration and readlink.
+                    continue
             held = any(len(fields := line.split(maxsplit=7)) == 8
                        and fields[7] == str(path) and f'socket:[{fields[6]}]' in descriptors
                        for line in (directory / 'net/unix').read_text().splitlines()[1:])
@@ -151,7 +157,7 @@ class XephyrManager:
         return None
 
     def _save(self, runtime: DesktopRuntime, runtime_fd: int,
-              socket_info: os.stat_result | None = None) -> None:
+              socket_info: os.stat_result | None = None) -> os.stat_result:
         value = asdict(runtime)
         value['socket_dir'] = str(runtime.socket_dir)
         value['xauthority'] = str(runtime.xauthority)
@@ -171,6 +177,7 @@ class XephyrManager:
                 json.dump(value, stream)
                 stream.write('\n')
             os.replace(temporary, 'xephyr.json', src_dir_fd=runtime_fd, dst_dir_fd=runtime_fd)
+            return info
         finally:
             try:
                 os.unlink(temporary, dir_fd=runtime_fd)
@@ -185,7 +192,7 @@ class XephyrManager:
         finally:
             os.close(current)
 
-    def start(self) -> DesktopRuntime:
+    def start(self, *, keyboard: DesktopConfig | None = None) -> DesktopRuntime:
         _private_runtime(self.paths.runtime_dir, os.getuid())
         with ExitStack() as stack:
             runtime_fd = self._open_private(self.paths.runtime_dir)
@@ -209,6 +216,7 @@ class XephyrManager:
             created_authority = False
             process = None
             authority_info = None
+            record_info = None
             linked_info = None
             name = f'X{display}'
             try:
@@ -218,10 +226,14 @@ class XephyrManager:
                 self._check_directory(self.paths.runtime_dir, runtime_fd)
                 # Inherit the retained directory so Xephyr's authority reads also
                 # stay anchored if the lexical runtime path is substituted.
+                # Keep the XKB map when the setup client disconnects before Openbox connects.
                 argv = ['Xephyr', f':{display}', '-auth', f'/proc/self/fd/{runtime_fd}/Xauthority',
-                        '-nolisten', 'tcp', '-extension', 'MIT-SHM', '-screen', self.screen]
+                        '-nolisten', 'tcp', '-extension', 'MIT-SHM', '-noreset', '-screen', self.screen]
                 if self.resize:
-                    argv.append('-resizeable')
+                    # Xephyr resizes its root window but can leave the RandR
+                    # output (and synthesized Xinerama head) at its old size.
+                    # Openbox follows root ConfigureNotify with RandR disabled.
+                    argv.extend(('-resizeable', '-extension', 'RANDR'))
                 process = subprocess.Popen(argv, start_new_session=True, pass_fds=(runtime_fd,),
                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self._process = process
@@ -231,7 +243,7 @@ class XephyrManager:
                         or identity.executable != str(Path(expected).resolve())):
                     raise ValueError('Cannot verify Xephyr process identity')
                 runtime = DesktopRuntime(display, directory, authority, identity)
-                self._save(runtime, runtime_fd)
+                record_info = self._save(runtime, runtime_fd)
                 source = _X11_DIR / name
                 deadline = time.monotonic() + self.timeout
                 while True:
@@ -239,30 +251,43 @@ class XephyrManager:
                         raise ValueError('Xephyr exited before its socket was ready')
                     verified = self._socket_owned(source, identity)
                     if verified is not None:
-                        os.link(name, name, src_dir_fd=source_fd, dst_dir_fd=sockets_fd,
-                                follow_symlinks=False)
-                        linked_info = verified
-                        after = os.stat(name, dir_fd=sockets_fd, follow_symlinks=False)
-                        reverified = self._socket_owned(source, identity)
-                        if (not os.path.samestat(verified, after) or reverified is None
-                                or not os.path.samestat(reverified, after)):
-                            raise ValueError('Xephyr socket ownership changed during startup')
-                        self._save(runtime, runtime_fd, after)
-                        self._check_directory(self.paths.runtime_dir, runtime_fd)
-                        self._check_directory(directory.parent, parent_fd)
-                        self._check_directory(directory, sockets_fd)
-                        return runtime
+                        break
                     if time.monotonic() >= deadline:
                         raise ValueError('Timed out waiting for the authenticated Xephyr socket')
                     time.sleep(self.poll_interval)
+                # While the keymap is pending, only the recovery record exists.
+                if keyboard is not None:
+                    _configure_keyboard(runtime, keyboard, runtime_fd, authority_info)
+                    current = self._socket_owned(source, identity)
+                    if current is None or not os.path.samestat(verified, current):
+                        raise ValueError('Xephyr socket ownership changed during startup')
+                os.link(name, name, src_dir_fd=source_fd, dst_dir_fd=sockets_fd, follow_symlinks=False)
+                linked_info = verified
+                after = os.stat(name, dir_fd=sockets_fd, follow_symlinks=False)
+                reverified = self._socket_owned(source, identity)
+                if (not os.path.samestat(verified, after) or reverified is None
+                        or not os.path.samestat(reverified, after)):
+                    raise ValueError('Xephyr socket ownership changed during startup')
+                self._check_directory(self.paths.runtime_dir, runtime_fd)
+                self._check_directory(directory.parent, parent_fd)
+                self._check_directory(directory, sockets_fd)
+                for filename, expected_info in (('Xauthority', authority_info), ('xephyr.json', record_info)):
+                    current = os.stat(filename, dir_fd=runtime_fd, follow_symlinks=False)
+                    if not os.path.samestat(expected_info, current):
+                        raise ValueError('Private Desktop runtime files changed during startup')
+                record_info = self._save(runtime, runtime_fd, after)
+                return runtime
             except BaseException:
                 if runtime is not None:
                     self._terminate(runtime.xephyr_identity)
+                if record_info is not None:
                     try:
-                        os.unlink('xephyr.json', dir_fd=runtime_fd)
+                        current = os.stat('xephyr.json', dir_fd=runtime_fd, follow_symlinks=False)
+                        if os.path.samestat(record_info, current):
+                            os.unlink('xephyr.json', dir_fd=runtime_fd)
                     except FileNotFoundError:
                         pass
-                elif process is not None:
+                if runtime is None and process is not None:
                     # This unreaped direct child was created by this call, even
                     # if interruption prevented capturing its /proc identity.
                     process.terminate()
@@ -308,6 +333,9 @@ class XephyrManager:
                     value = json.load(stream)
                     if not self._recorded_file_matches(info, value, 'record'):
                         raise ValueError('Recorded Desktop runtime file changed')
+                if value['socket_device'] is None and value['socket_inode'] is None:
+                    raise ValueError('Xephyr startup has not completed. Retry when it finishes or '
+                                     'use desktop --restart after an interrupted start.')
                 display = value['display']
                 if type(display) is not int or not 20 <= display <= 99:
                     raise ValueError('Invalid recorded Desktop runtime')
@@ -564,6 +592,32 @@ def _matches_running_policy(project: ComposeProject, container: str, desired: Pa
         return False
 
 
+def _configure_keyboard(runtime: DesktopRuntime, settings: DesktopConfig, runtime_fd: int,
+                        authority_info: os.stat_result) -> None:
+    command = ['setxkbmap', '-layout', settings.keyboard_layout, '-option', '']
+    if settings.keyboard_options:
+        for option in settings.keyboard_options.split(','):
+            command.extend(('-option', option))
+    try:
+        with ExitStack() as stack:
+            authority = os.open(runtime.xauthority.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=runtime_fd)
+            stack.callback(os.close, authority)
+            info = os.fstat(authority)
+            if (not os.path.samestat(info, authority_info) or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                raise ValueError('Invalid private Xauthority for Desktop keyboard setup')
+            env = dict(PATH=os.environ.get('PATH', os.defpath), DISPLAY=f':{runtime.display}',
+                       XAUTHORITY=f'/proc/self/fd/{authority}')
+            subprocess.run(command, env=env, pass_fds=(authority,),
+                           capture_output=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    else:
+        return
+    raise ValueError('Cannot configure the nested Desktop keyboard. Check the XKB layout and options.') from None
+
+
 def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
                    no_sandbox: bool, app_args: Sequence[str]) -> int:
     """Launch a detached Desktop with fresh process-scoped host credentials."""
@@ -620,8 +674,8 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
                 sync.start(runtime, host_display=os.environ['DISPLAY'])
             print('Claude Desktop is already running; its environment is unchanged. '
                   'Existing per-run sandbox, clipboard and container security choices persist until '
-                  'restart or stop. '
-                  'Use desktop --restart to apply current host credentials and launch policy.')
+                  'restart or stop. Use desktop --restart to apply current host credentials, '
+                  'keyboard settings and launch policy.')
             return 0
     if restart:
         project.ensure_inner_docker()
@@ -636,7 +690,7 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
     def prepare_runtime() -> None:
         nonlocal runtime, created_runtime
         if runtime is None:
-            runtime = manager.start()
+            runtime = manager.start(keyboard=config.desktop)
             created_runtime = True
         project.desktop_runtime = runtime
         if desktop_seccomp is not None:

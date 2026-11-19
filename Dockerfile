@@ -43,6 +43,13 @@ RUN set -eu; \
     chmod 0555 /out/claude; \
     rm /tmp/claude-code.version /tmp/claude-code-manifest.json
 
+FROM ubuntu:26.04 AS claude-desktop-package
+
+COPY --from=mise /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY image/claude-desktop-apt.sh /tmp/claude-desktop-apt.sh
+COPY image/claude-desktop.version /tmp/claude-desktop.version
+RUN /bin/sh /tmp/claude-desktop-apt.sh download /tmp/claude-desktop.version
+
 FROM ubuntu:26.04 AS common
 
 ARG CLAUDE_USER=claude
@@ -135,17 +142,18 @@ FROM common AS desktop-runtime
 
 USER root
 
-# Anthropic's signed official repository, plus the X11/Electron runtime only.
-RUN curl -fsSLo /usr/share/keyrings/claude-desktop-archive-keyring.asc \
-      https://downloads.claude.ai/claude-desktop/key.asc \
- && printf '%s\n' 'deb [signed-by=/usr/share/keyrings/claude-desktop-archive-keyring.asc] https://downloads.claude.ai/claude-desktop/apt/stable stable main' \
-      > /etc/apt/sources.list.d/claude-desktop.list \
- && apt-get update \
+# Runtime requirements from the official package, plus the nested X11 session
+# and Electron libraries. This layer is independent of the selected release.
+RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      claude-desktop openbox fonts-dejavu-core procps \
-      libasound2t64 libatk-bridge2.0-0t64 libgtk-3-0t64 libnss3 \
-      libx11-xcb1 libgbm1 libxss1 libxtst6 libxkbcommon0 libxshmfence1 \
- && rm -rf /var/lib/apt/lists/*
+      openbox fonts-dejavu-core procps \
+      libasound2t64 libatk-bridge2.0-0t64 libgtk-3-0t64 libnotify4 libnss3 \
+      xdg-utils libatspi2.0-0t64 libdrm2 libgbm1 libxcb-dri3-0 libsecret-1-0 \
+      libglib2.0-bin libc6 libxtst6 libuuid1 libpipewire-0.3-0t64 \
+      xdg-desktop-portal xdg-desktop-portal-gtk \
+      libx11-xcb1 libxss1 libxkbcommon0 libxshmfence1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && printf '%s\n' 'CLAUDE_DESKTOP_ADD_REPO=false' > /etc/default/claude-desktop
 
 # Every Claude window fills the nested X server without window decorations.
 RUN sed -i 's#</applications>#<application class="*"><decor>no</decor><maximized>yes</maximized></application></applications>#' \
@@ -179,6 +187,13 @@ RUN set -eu; \
     fi \
  && rm -f /usr/local/lib/claude-image/customize-user.sh \
  && rm -rf /var/lib/apt/lists/* /root/.cache/mise
+
+# Bind the artifact without retaining the archive in an image layer. dpkg
+# preserves the official maintainer scripts, launchers and sandbox permissions.
+RUN --mount=type=bind,from=claude-desktop-package,source=/out,target=/tmp/desktop-package \
+    --network=none \
+    DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/desktop-package/claude-desktop.deb \
+    || { echo 'Claude Desktop installation failed. Check dpkg output and the desktop-runtime dependencies in Dockerfile.' >&2; exit 1; }
 
 USER ${CLAUDE_USER}
 

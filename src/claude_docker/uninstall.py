@@ -18,6 +18,7 @@ from .compose import ComposeProject
 from .config import AccountInfo, load_config, resolve_config_file
 from .customize import user_customize_path
 from .desktop import stop_desktop_runtime
+from .desktop_version import desktop_version_path
 from .installer import (InstallLayout, _check_link, _exists, _owned_directory, _verify_release,
                         installation_lock, _write_json, _sync_directory)
 from .model import AppConfig
@@ -372,7 +373,7 @@ def _protected_data(layout: InstallLayout, *, purge: bool = False) -> tuple[Path
         targets += (paths.config_dir, resolve_config_file(env=os.environ, paths=paths))
     # Keep lexical and resolved paths without opening or validating these inputs.
     # realpath tolerates broken links and loops.
-    build_inputs = (user_customize_path(paths), code_version_path(paths))
+    build_inputs = (user_customize_path(paths), code_version_path(paths), desktop_version_path(paths))
     build_aliases = (alias for path in build_inputs
                      for alias in (Path(os.path.abspath(path)), Path(os.path.realpath(path))))
     return tuple(dict.fromkeys((*_aliases(targets), *build_aliases)))

@@ -40,15 +40,24 @@ _STATIC_POLICY_FILES = (
 )
 
 
-BUNDLE_FILES = tuple(path for path in _STATIC_POLICY_FILES
+_DYNAMIC_POLICY_FILES = tuple(path for path in _STATIC_POLICY_FILES
                      if path != "security/desktop-seccomp-v0.2.4-linux-amd64.json") + (
     "src/claude_docker/seccomp_source.py", "src/claude_docker/seccomp_profile.py",
     "src/claude_docker/seccomp_cache.py",
 )
 
 
+_DESKTOP_VERSION_FILES = _DYNAMIC_POLICY_FILES + (
+    "image/claude-desktop.version", "image/claude-desktop-apt.sh",
+    "src/claude_docker/desktop_version.py", "src/claude_docker/version_pin.py",
+)
+
+BUNDLE_FILES = _DESKTOP_VERSION_FILES + ("src/claude_docker/desktop_resolver.py",)
+
 # These are exact historical inventories, not permission to omit individual
-# current inputs. Earlier releases had 39 files before Claude Code pinning,
+# current inputs. The first Desktop pinning bundle had 47 files and the
+# preceding dynamic seccomp bundle had 43.
+# Earlier releases had 39 files before Claude Code pinning,
 # 37 before user customization, 35 before user tool profiles, 34 before the license,
 # 30 before the policy assets, and 29 before uninstall.py.
 _PRE_CODE_VERSION_FILES = frozenset(_STATIC_POLICY_FILES) - {
@@ -64,8 +73,9 @@ _PRE_POLICY_FILES = _PRE_LICENSE_FILES - {
     "security/desktop-seccomp-v0.2.4-linux-amd64.json",
     "security/LICENSE.moby-profiles", "security/NOTICE.moby-profiles",
 }
-_RELEASE_INVENTORIES = (frozenset(BUNDLE_FILES), frozenset(_STATIC_POLICY_FILES), _PRE_CODE_VERSION_FILES, _PRE_CUSTOMIZE_FILES,
-                        _PRE_USER_TOOLS_FILES, _PRE_LICENSE_FILES, _PRE_POLICY_FILES,
+_RELEASE_INVENTORIES = (frozenset(BUNDLE_FILES), frozenset(_DESKTOP_VERSION_FILES),
+                        frozenset(_DYNAMIC_POLICY_FILES), frozenset(_STATIC_POLICY_FILES),
+                        _PRE_CODE_VERSION_FILES, _PRE_CUSTOMIZE_FILES, _PRE_USER_TOOLS_FILES, _PRE_LICENSE_FILES, _PRE_POLICY_FILES,
                         _PRE_POLICY_FILES - {"src/claude_docker/uninstall.py"})
 
 

@@ -333,7 +333,8 @@ class ComposeProject:
         if self._teardown_only:
             raise ValueError('Recovery project permits mount-free teardown only')
         if build_context is None:
-            with image_build_inputs(self.program_dir, self.paths, os.environ) as context:
+            with image_build_inputs(self.program_dir, self.paths, os.environ, runner=self.runner,
+                                    include_desktop=service == 'claude-desktop') as context:
                 self.build(service, pull=pull, no_cache=no_cache, build_context=context)
             return
         args = ['build']

@@ -25,6 +25,8 @@ class DesktopConfig:
     sandbox: bool
     clipboard: Literal["manual", "bidirectional"]
     seccomp: Literal["default", "chromium"] = "default"
+    keyboard_layout: str = "us,ru"
+    keyboard_options: str = "grp:alt_shift_toggle"
 
 
 @dataclass(frozen=True)

@@ -28,7 +28,7 @@ EXAMPLE_CONFIG = '''# Settings omitted here retain detected host-account and hom
 # UID/GID range: 1..4294967294. Account names: [a-z_][a-z0-9_-]*, max 32.
 # The root account and filesystem root as container home are not supported.
 # Boolean environment overrides accept true/1/yes/on or false/0/no/off,
-# case-insensitively, with surrounding spaces permitted. Empty scalars fail.
+# case-insensitively, with surrounding spaces permitted. Only keyboard_options can be empty.
 docker_mode = "none" # "sysbox" explicitly enables isolated inner Docker.
 
 [container]
@@ -59,6 +59,8 @@ mount = true # false disables this mount.
 sandbox = true # false explicitly requests Chromium --no-sandbox.
 clipboard = "manual" # "bidirectional" opts into background synchronization.
 seccomp = "default" # "chromium" explicitly enables the daemon-derived namespace policy.
+keyboard_layout = "us,ru" # Up to four comma-separated XKB layouts.
+keyboard_options = "grp:alt_shift_toggle" # Comma-separated XKB options. "" clears them.
 
 [environment]
 # These lists contain exact variable NAMES only, never credential values.
@@ -73,7 +75,8 @@ _SCHEMA = {
     "docker_mode": "mode",
     "container": {"user": "user", "uid": "id", "gid": "id", "home": "container_home", "mounts": "mounts"},
     "state": {name: {"source": "path", "mount": "bool"} for name in ("code", "code_json", "desktop")},
-    "desktop": {"sandbox": "bool", "clipboard": "clipboard", "seccomp": "seccomp"},
+    "desktop": {"sandbox": "bool", "clipboard": "clipboard", "seccomp": "seccomp",
+                "keyboard_layout": "keyboard_layout", "keyboard_options": "keyboard_options"},
     "environment": {"required": "names", "optional": "names"},
 }
 _OVERRIDES = {
@@ -91,7 +94,14 @@ _OVERRIDES = {
     "CLAUDE_DESKTOP_SANDBOX": ("desktop.sandbox", "bool"),
     "CLAUDE_DESKTOP_CLIPBOARD": ("desktop.clipboard", "clipboard"),
     "CLAUDE_DESKTOP_SECCOMP": ("desktop.seccomp", "seccomp"),
+    "CLAUDE_DESKTOP_KEYBOARD_LAYOUT": ("desktop.keyboard_layout", "keyboard_layout"),
+    "CLAUDE_DESKTOP_KEYBOARD_OPTIONS": ("desktop.keyboard_options", "keyboard_options"),
 }
+
+_XKB_NAME = r"[A-Za-z0-9_][A-Za-z0-9_-]{0,31}"
+_XKB_LAYOUTS = re.compile(rf"{_XKB_NAME}(?:,{_XKB_NAME}){{0,3}}")
+_XKB_OPTION = rf"{_XKB_NAME}(?::{_XKB_NAME})?"
+_XKB_OPTIONS = re.compile(rf"(?:{_XKB_OPTION}(?:,{_XKB_OPTION})*)?")
 
 
 def _invalid(setting: str, requirement: str, value: Any) -> ValueError:
@@ -135,6 +145,12 @@ def _validate(value: Any, kind: str, setting: str, home: Path) -> Any:
                    "seccomp": ("default", "chromium")}[kind]
         if _text(value, setting) not in allowed:
             raise _invalid(setting, "expected one of " + ", ".join(allowed), value)
+    elif kind == "keyboard_layout":
+        if type(value) is not str or not _XKB_LAYOUTS.fullmatch(value):
+            raise _invalid(setting, "expected one to four comma-separated XKB layout names", value)
+    elif kind == "keyboard_options":
+        if type(value) is not str or len(value) > 1024 or not _XKB_OPTIONS.fullmatch(value):
+            raise _invalid(setting, "expected comma-separated XKB option names or an empty string", value)
     elif kind in ("mounts", "names"):
         if type(value) is not list:
             raise _invalid(setting, "expected an array", value)
@@ -197,7 +213,9 @@ def load_config(*, env: Mapping[str, str], paths: HostPaths, account: AccountInf
             "code_json": {"source": str(paths.home / ".claude.json"), "mount": True},
             "desktop": {"source": str(paths.home / ".config/Claude"), "mount": True},
         },
-        "desktop": {"sandbox": True, "clipboard": "manual", "seccomp": "default"},
+        "desktop": {"sandbox": True, "clipboard": "manual", "seccomp": "default",
+                    "keyboard_layout": DesktopConfig.keyboard_layout,
+                    "keyboard_options": DesktopConfig.keyboard_options},
         "environment": {"required": [], "optional": []},
     }
     values = {}
@@ -221,13 +239,14 @@ def load_config(*, env: Mapping[str, str], paths: HostPaths, account: AccountInf
     for name, (setting, kind) in _OVERRIDES.items():
         if name not in env:
             continue
-        value = _text(env[name], name)
+        value = env[name]
         if kind == "bool":
-            text = value.strip().lower()
+            text = _text(value, name).strip().lower()
             if text not in ("true", "1", "yes", "on", "false", "0", "no", "off"):
                 raise _invalid(name, "expected true/1/yes/on or false/0/no/off", value)
             value = text in ("true", "1", "yes", "on")
         elif kind == "id":
+            value = _text(value, name)
             if not re.fullmatch(r"[0-9]+", value):
                 raise _invalid(name, "expected an integer in 1..4294967294", value)
             try:
@@ -252,7 +271,7 @@ def load_config(*, env: Mapping[str, str], paths: HostPaths, account: AccountInf
         state_code=StateMountConfig(values["state.code.source"], values["state.code.mount"]),
         state_code_json=StateMountConfig(values["state.code_json.source"], values["state.code_json.mount"]),
         state_desktop=StateMountConfig(values["state.desktop.source"], values["state.desktop.mount"]),
-        desktop=DesktopConfig(values["desktop.sandbox"], values["desktop.clipboard"], values["desktop.seccomp"]),
+        desktop=DesktopConfig(**{key: values[f"desktop.{key}"] for key in _SCHEMA["desktop"]}),
         environment=EnvironmentConfig(values["environment.required"], values["environment.optional"]),
     )
 

@@ -74,7 +74,9 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         patch.object(desktop, 'CommandRunner', return_value=self.runner, create=True).start()
         patch.object(desktop.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name).start()
         patch.object(desktop.XephyrManager, 'load', return_value=None, create=True).start()
-        patch.object(desktop.XephyrManager, 'start', side_effect=lambda: self.events.append('start') or self.runtime).start()
+        self.start_xephyr = patch.object(
+            desktop.XephyrManager, 'start', side_effect=lambda **kwargs: self.events.append('start') or self.runtime
+        ).start()
         patch.object(desktop.XephyrManager, 'stop', side_effect=lambda runtime: self.events.append('stop')).start()
         patch.object(desktop.XephyrManager, 'stop_recorded', side_effect=lambda **kwargs: self.events.append('stop')).start()
         patch.object(desktop.time, 'sleep').start()
@@ -201,6 +203,7 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
 
     def test_default_starts_only_desktop_then_detached_openbox_and_sandboxed_app(self):
         self.assertEqual(self.launch(app_args=('--help', 'literal; $(false)')), 0)
+        self.start_xephyr.assert_called_once_with(keyboard=self.config.desktop)
         ups = [argv for argv, _ in self.runner.calls if 'up' in argv]
         self.assertEqual(ups[0][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-desktop'])
         detached = [argv for argv, _ in self.runner.calls if argv[:2] == ['docker', 'exec'] and '-d' in argv]
@@ -247,11 +250,32 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         self.assertEqual(self.stderr.getvalue(), '')
 
     def test_display_starts_before_any_runtime_override_is_written(self):
-        def start():
+        def start(*, keyboard):
             self.assertFalse((self.paths.runtime_dir / 'compose.none.json').exists())
             return self.runtime
         with patch.object(desktop.XephyrManager, 'start', side_effect=start):
             self.assertEqual(self.launch(), 0)
+
+    def test_keyboard_setup_failure_precedes_compose_mutation(self):
+        self.start_xephyr.side_effect = ValueError('Cannot configure the nested Desktop keyboard')
+        with self.assertRaisesRegex(ValueError, 'keyboard'):
+            self.launch()
+        self.start_xephyr.assert_called_once_with(keyboard=self.config.desktop)
+        self.assertEqual(self.events, [])
+        self.assertFalse(any(token in argv for argv, _ in self.runner.calls
+                             for token in ('up', 'stop', 'openbox')))
+
+    def test_reuse_keeps_active_keyboard_and_restart_applies_changed_settings(self):
+        self.project().state.write_mode('none')
+        self.runner.running = True
+        changed = replace(self.config, desktop=replace(self.config.desktop, keyboard_layout='de,fr',
+                                                       keyboard_options=''))
+        with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime):
+            self.assertEqual(self.launch(changed), 0)
+        self.start_xephyr.assert_not_called()
+        self.assertEqual(self.launch(changed, restart=True), 0)
+        self.assertEqual(self.events, ['stop', 'start'])
+        self.start_xephyr.assert_called_once_with(keyboard=changed.desktop)
 
     def test_sandbox_launch_failure_propagates_without_retry_or_downgrade(self):
         self.runner.app_exit = 37

@@ -60,7 +60,7 @@ class RecordedCleanupTests(unittest.TestCase):
         (self.fixture.x11 / 'X20').unlink()
         self.assertTrue((self.runtime.socket_dir / 'X20').exists())
 
-        def start():
+        def start(*, keyboard):
             self.assertFalse(self.manager.record_path.exists())
             self.assertFalse(self.runtime.xauthority.exists())
             self.assertFalse((self.runtime.socket_dir / 'X20').exists())

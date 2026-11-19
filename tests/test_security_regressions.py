@@ -37,6 +37,7 @@ class RuntimeSourceSecurityTests(unittest.TestCase):
     def test_subprocess_calls_cannot_enable_shell_or_broad_process_kills(self):
         # Inspect calls, not warning/doc strings or the supported image Bash hook.
         for path, tree in self.sources:
+            parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
@@ -47,7 +48,28 @@ class RuntimeSourceSecurityTests(unittest.TestCase):
                             self.assertIs(keyword.value.value, False)
                     name = ast.unparse(node.func)
                     self.assertNotIn(name, ('os.system', 'os.popen', 'subprocess.getoutput',
-                                            'subprocess.getstatusoutput', 'os.killpg'))
+                                            'subprocess.getstatusoutput'))
+                    if name == 'os.killpg':
+                        # Only the runner can signal its newly created session, by the PID it owns.
+                        self.assertEqual(path.name, 'commands.py')
+                        owner = node
+                        while owner in parents and not isinstance(owner, ast.With):
+                            owner = parents[owner]
+                        self.assertIsInstance(owner, ast.With)
+                        item, = owner.items
+                        self.assertIsInstance(item.context_expr, ast.Call)
+                        self.assertEqual(ast.unparse(item.context_expr.func), 'subprocess.Popen')
+                        self.assertIn('start_new_session=True',
+                                      [ast.unparse(keyword) for keyword in item.context_expr.keywords])
+                        self.assertEqual(ast.unparse(node.args[0]), f'{ast.unparse(item.optional_vars)}.pid')
+                        signal_attempt = parents[parents[node]]
+                        self.assertIsInstance(signal_attempt, ast.Try)
+                        self.assertEqual(ast.unparse(signal_attempt.body[0]),
+                                         f'_child_has_exited({ast.unparse(node.args[0])})')
+                    if path.name == 'commands.py' and name == 'os.waitid':
+                        flags = {ast.unparse(flag) for flag in ast.walk(node.args[2])
+                                 if isinstance(flag, ast.Attribute)}
+                        self.assertIn('os.WNOWAIT', flags)
                     if name == 'os.kill' and node.args and isinstance(node.args[0], (ast.Constant, ast.UnaryOp)):
                         self.assertGreater(ast.literal_eval(node.args[0]), 0)
 

@@ -31,7 +31,7 @@ class HelpTests(unittest.TestCase):
                 detailed = self.help(command)
                 usage = detailed.split('\n\n', 1)[0]
                 for flag in ('--smoke', '--desktop', '--clipboard', '--clipboard-sync',
-                             '--no-sandbox', '--all', '--restart', '--purge', '--yes', '--update-claude'):
+                             '--no-sandbox', '--all', '--restart', '--purge', '--yes', '--update-claude', '--update-desktop'):
                     if flag in usage:
                         self.assertIn(flag, text)
         for command in ('config init', 'tools init', 'tools lock', 'customize init', 'cleanup inner-docker',
@@ -71,8 +71,10 @@ class HelpTests(unittest.TestCase):
             text = self.help(command)
             self.assertIn('--update-claude', text)
             self.assertIn('latest Claude Code release', text)
-            self.assertIn('before Claude Code is copied', text)
-            self.assertIn('The first build saves the latest Claude Code version', text)
+            self.assertIn('--update-desktop', text)
+            self.assertIn('signed Desktop package version', text)
+            self.assertIn('before installing Desktop and copying Claude Code', text)
+            self.assertIn('Later builds use the saved versions', text)
         self.assertIn('--smoke', self.help('check'))
         self.assertIn('temporary container', self.help('check'))
         self.assertIn('next start', self.help('check'))

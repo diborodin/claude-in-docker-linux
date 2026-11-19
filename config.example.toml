@@ -4,7 +4,7 @@
 # UID/GID range: 1..4294967294. Account names: [a-z_][a-z0-9_-]*, max 32.
 # The root account and filesystem root as container home are not supported.
 # Boolean environment overrides accept true/1/yes/on or false/0/no/off,
-# case-insensitively, with surrounding spaces permitted. Empty scalars fail.
+# case-insensitively, with surrounding spaces permitted. Only keyboard_options can be empty.
 docker_mode = "none" # "sysbox" explicitly enables isolated inner Docker.
 
 [container]
@@ -35,6 +35,8 @@ mount = true # false disables this mount.
 sandbox = true # false explicitly requests Chromium --no-sandbox.
 clipboard = "manual" # "bidirectional" opts into background synchronization.
 seccomp = "default" # "chromium" explicitly enables the daemon-derived namespace policy.
+keyboard_layout = "us,ru" # Up to four comma-separated XKB layouts.
+keyboard_options = "grp:alt_shift_toggle" # Comma-separated XKB options. "" clears them.
 
 [environment]
 # These lists contain exact variable NAMES only, never credential values.

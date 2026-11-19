@@ -77,7 +77,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_version_file_agrees_with_package(self):
         self.assertEqual((ROOT / "VERSION").read_text().strip(), __version__)
-        self.assertEqual(__version__, "0.3.7")
+        self.assertEqual(__version__, "0.4.0")
 
     def test_install_copies_runtime_bundle_with_verified_manifest_and_links(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
@@ -114,7 +114,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_policy_bundle_is_complete_readable_and_importable(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
-        self.assertEqual(len(manifest.files), 43)
+        self.assertEqual(len(manifest.files), 48)
         installed = self.layout.release_dir(__version__)
         for item in manifest.files:
             if str(item.path).startswith('security/'):
@@ -186,11 +186,11 @@ class InstallerTests(unittest.TestCase):
             '.dockerignore', 'claude-docker', 'install', 'VERSION', 'README.md', 'LICENSE',
             'Dockerfile', 'compose.yaml', 'compose.sysbox.yaml', 'config.example.toml',
             'image/customize.sh', 'image/customize.example.sh', 'image/mise.lock', 'image/mise.toml',
-            'image/claude-code.version',
+            'image/claude-code.version', 'image/claude-desktop.version', 'image/claude-desktop-apt.sh',
             'security/LICENSE.moby-profiles', 'security/NOTICE.moby-profiles',
         } | {f'src/claude_docker/{module}.py' for module in (
             '__init__', '__main__', 'checks', 'claude_version', 'cli', 'clipboard', 'commands', 'compose',
-            'config', 'customize', 'desktop', 'environment', 'installer', 'manifest', 'model',
+            'config', 'customize', 'desktop', 'desktop_resolver', 'desktop_version', 'version_pin', 'environment', 'installer', 'manifest', 'model',
             'mounts', 'paths', 'process', 'seccomp_source', 'seccomp_cache', 'seccomp_profile', 'seccomp', 'state', 'uninstall', 'tool_config', 'image_tools',
         )}
         self.assertEqual(paths, expected)

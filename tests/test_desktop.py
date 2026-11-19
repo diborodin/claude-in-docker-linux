@@ -18,7 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from claude_docker import desktop
 from claude_docker import paths as host_paths
-from claude_docker.model import DesktopRuntime, ProcessIdentity
+from claude_docker.model import DesktopConfig, DesktopRuntime, ProcessIdentity
 from tests.test_compose import ComposeFixture
 
 
@@ -125,7 +125,8 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(runtime.xephyr_identity, ProcessIdentity(123, 456, '/usr/bin/Xephyr'))
         authority_fd = self.popen_kwargs['pass_fds'][0]
         self.assertEqual(self.argv, ['Xephyr', ':20', '-auth', f'/proc/self/fd/{authority_fd}/Xauthority',
-                                    '-nolisten', 'tcp', '-extension', 'MIT-SHM', '-screen', '1024x768', '-resizeable'])
+                                    '-nolisten', 'tcp', '-extension', 'MIT-SHM', '-noreset',
+                                    '-screen', '1024x768', '-resizeable', '-extension', 'RANDR'])
         self.assertTrue(self.popen_kwargs['start_new_session'])
         self.assertNotIn('-ac', self.argv)
         self.assertEqual(stat.S_IMODE(runtime.xauthority.stat().st_mode), 0o600)
@@ -146,6 +147,84 @@ class DesktopTests(unittest.TestCase):
         runtime = self.start()
         self.assertEqual(self.manager.load(), runtime)
         self.assertEqual(self.signals, [])
+
+    def test_pending_keyboard_setup_cannot_be_reused(self):
+        loader = desktop.XephyrManager(self.paths)
+        keyboard = DesktopConfig(True, 'manual', keyboard_layout='de,gb',
+                                 keyboard_options='grp:alt_shift_toggle,ctrl:nocaps')
+
+        def configure(argv, **kwargs):
+            if argv[0] == 'xauth':
+                return self.xauth(argv, **kwargs)
+            with self.assertRaisesRegex(ValueError, 'startup'):
+                loader.load()
+            self.assertEqual(argv, ['setxkbmap', '-layout', 'de,gb', '-option', '',
+                                    '-option', 'grp:alt_shift_toggle', '-option', 'ctrl:nocaps'])
+            self.assertEqual(kwargs['env']['DISPLAY'], ':20')
+            authority = Path(kwargs['env']['XAUTHORITY'])
+            self.assertEqual(authority.resolve(), self.runtime / 'Xauthority')
+            self.assertTrue(kwargs['check'])
+            self.assertFalse(kwargs.get('shell', False))
+            self.assertNotIn('SECRET', kwargs['env'])
+            self.assertTrue(self.manager.record_path.exists())
+
+        with (patch.object(desktop.subprocess, 'run', side_effect=configure) as command,
+              patch.object(desktop.subprocess, 'Popen', side_effect=self.fake_xephyr),
+              patch.object(desktop.os, 'kill', side_effect=lambda pid, sig: (self.proc / str(pid) / 'stat').unlink()),
+              patch.dict(os.environ, DISPLAY=':0', XAUTHORITY='/parent-authority', SECRET='do-not-leak')):
+            runtime = self.manager.start(keyboard=keyboard)
+        self.assertEqual(command.call_count, 2)
+        self.assertEqual(loader.load(), runtime)
+
+    def test_start_publishes_runtime_when_unrelated_fd_closes_during_verification(self):
+        auxiliary = self.proc / '123' / 'fd' / '4'
+        exposed = self.exposure / 'X20'
+        readlink = os.readlink
+
+        def configure(argv, **kwargs):
+            if argv[0] == 'xauth':
+                return self.xauth(argv, **kwargs)
+            auxiliary.symlink_to('/dev/null')
+
+        def readlink_after_close(path, *args, **kwargs):
+            if path == auxiliary and exposed.exists():
+                auxiliary.unlink()
+            return readlink(path, *args, **kwargs)
+
+        def terminate(pid, sig):
+            (self.proc / str(pid) / 'stat').unlink()
+
+        with (patch.object(desktop.subprocess, 'run', side_effect=configure),
+              patch.object(desktop.subprocess, 'Popen', side_effect=self.fake_xephyr),
+              patch.object(desktop.os, 'readlink', side_effect=readlink_after_close),
+              patch.object(desktop.os, 'kill', side_effect=terminate)):
+            runtime = self.manager.start(keyboard=DesktopConfig(True, 'manual'))
+        self.assertFalse(auxiliary.is_symlink())
+        self.assertEqual(self.manager.load(), runtime)
+
+    def test_failed_keyboard_setup_keeps_record_unusable_and_cleans_runtime(self):
+        loader = desktop.XephyrManager(self.paths)
+
+        def configure(argv, **kwargs):
+            if argv[0] == 'xauth':
+                return self.xauth(argv, **kwargs)
+            with self.assertRaisesRegex(ValueError, 'startup'):
+                loader.load()
+            raise subprocess.CalledProcessError(1, argv)
+
+        def terminate(pid, sig):
+            self.signals.append((pid, sig))
+            (self.proc / str(pid) / 'stat').unlink()
+
+        with (patch.object(desktop.subprocess, 'run', side_effect=configure),
+              patch.object(desktop.subprocess, 'Popen', side_effect=self.fake_xephyr),
+              patch.object(desktop.os, 'kill', side_effect=terminate)):
+            with self.assertRaisesRegex(ValueError, 'keyboard'):
+                self.manager.start(keyboard=DesktopConfig(True, 'manual'))
+        self.assertEqual(self.signals, [(123, signal.SIGTERM)])
+        self.assertIsNone(loader.load())
+        self.assertEqual(list(self.runtime.iterdir()), [])
+        self.assertEqual(list(self.exposure.iterdir()), [])
 
     def test_load_rejects_changed_process_cookie_or_socket_without_cleanup(self):
         runtime = self.start()
@@ -495,6 +574,8 @@ class DesktopComposeTests(ComposeFixture, unittest.TestCase):
         self.assertEqual(self.runner.calls, [])
         project.state.write_mode('none')
         project.state.write_pending('sysbox')
+        self.seed_code_version(self.paths.config_dir)
+        (self.paths.config_dir / 'claude-desktop.version').write_text('5.11492.5\n')
         project.build('claude-desktop', pull=False, no_cache=False)
         project.stop_service('claude-desktop')
         project.down()

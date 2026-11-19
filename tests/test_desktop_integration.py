@@ -1,11 +1,13 @@
 """Explicitly opted-in, isolated smoke test of the real Desktop runtime."""
 
 import base64
+import ctypes
 from dataclasses import replace
 import json
 import os
 import pwd
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -30,6 +32,21 @@ from claude_docker.mounts import prepare_mounts
 from claude_docker.paths import resolve_host_paths
 from claude_docker.seccomp import resolve_desktop_seccomp
 from claude_docker.seccomp_profile import decode_profile, desktop_profile
+
+
+def resize_x11_window(window, width, height):
+    x11 = ctypes.CDLL('libX11.so.6')
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError('Cannot connect to the parent X display to resize Xephyr')
+    try:
+        x11.XResizeWindow(display, int(window, 16), width, height)
+    finally:
+        x11.XCloseDisplay(display)
 
 
 class DesktopIntegrationTests(unittest.TestCase):
@@ -80,12 +97,11 @@ class DesktopIntegrationTests(unittest.TestCase):
         # Keep the real detached child's Popen alive until production stop.
         # This observes ownership only; start/stop and policy code stay real.
         managers = []
-        manager_class = desktop.XephyrManager
 
-        def observed_manager(*args, **kwargs):
-            manager = manager_class(*args, **kwargs)
-            managers.append(manager)
-            return manager
+        class ObservedXephyrManager(desktop.XephyrManager):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                managers.append(self)
 
         def command(*argv, environment=None, timeout=30, errors="strict"):
             return subprocess.run(argv, capture_output=True, text=True, errors=errors, timeout=timeout,
@@ -183,7 +199,7 @@ class DesktopIntegrationTests(unittest.TestCase):
                 with (patch.dict(os.environ, environment, clear=True),
                       patch.object(cli, 'ComposeProject', TestProject),
                       patch.object(desktop, 'ComposeProject', TestProject),
-                      patch.object(desktop, 'XephyrManager', observed_manager),
+                      patch.object(desktop, 'XephyrManager', ObservedXephyrManager),
                       patch.object(cli, 'CommandRunner', ObservedRunner),
                       patch.object(desktop, 'CommandRunner', ObservedRunner),
                       patch.object(desktop, 'desktop_socket_dir', return_value=root/'x11'),
@@ -299,7 +315,10 @@ class DesktopIntegrationTests(unittest.TestCase):
                             assert proc['attr/current'].strip() == 'docker-default (enforce)'
                         assert all('--no-sandbox' not in p['command'] and '--disable-setuid-sandbox' not in p['command'] for p in first + last)
                         report['window_tree'] = command('xwininfo','-root','-tree',environment=nested)
-                        assert 'Claude' in report['window_tree'], 'No Claude window in nested display'
+                        self.check_resizing(runtime, nested, report)
+                        report['keyboard'] = command('setxkbmap', '-query', environment=nested)
+                        self.assertRegex(report['keyboard'], r'(?m)^layout:\s+us,ru$')
+                        self.assertRegex(report['keyboard'], r'(?m)^options:\s+grp:alt_shift_toggle$')
                         assert not (paths.runtime_dir/'clipboard.json').exists()
                         report['manual_clipboard_verified'] = True
                         report['observed_seconds'] = 20
@@ -343,6 +362,34 @@ class DesktopIntegrationTests(unittest.TestCase):
             (artifacts/'desktop-seccomp-result.json').write_text(json.dumps(report,indent=2)+'\n')
             print(json.dumps({key:report.get(key) for key in ['status','artifacts','identity','launch_result',
                 'stop_result','observed_seconds','xephyr_gone','temporary_tree_removed','cleanup_errors']},indent=2),flush=True)
+
+    def check_resizing(self, runtime, nested, report):
+        outer_tree = self.command('xwininfo', '-root', '-tree', env=os.environ)
+        outer = re.search(rf'(?m)^\s+(0x[0-9a-f]+) "Xephyr on :{runtime.display}\.0\b', outer_tree)
+        app = re.search(r'(?m)^\s+(0x[0-9a-f]+) "Claude"', report['window_tree'])
+        self.assertIsNotNone(outer, 'Could not locate the isolated Xephyr window')
+        self.assertIsNotNone(app, 'Could not locate the Claude window inside Xephyr')
+        outer_window, app_window = outer[1], app[1]
+
+        def geometry(*args):
+            info = self.command('xwininfo', *args, env=nested)
+            fields = dict(re.findall(r'(?m)^\s*(Absolute upper-left [XY]|Width|Height):\s*(-?\d+)$', info))
+            return tuple(int(fields[key]) for key in ('Width', 'Height', 'Absolute upper-left X',
+                                                       'Absolute upper-left Y'))
+
+        report['resize'] = []
+        for size in ((1200, 850), (1450, 950), (900, 650)):
+            resize_x11_window(outer_window, *size)
+            deadline = time.monotonic() + 5
+            expected = (*size, 0, 0)
+            while True:
+                screen, app_geometry = geometry('-root'), geometry('-id', app_window)
+                if screen == app_geometry == expected or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            report['resize'].append(dict(target=size, screen=screen, claude=app_geometry))
+            self.assertEqual(screen, expected)
+            self.assertEqual(app_geometry, expected)
 
 
     def command(self, *argv, env=None, timeout=120):

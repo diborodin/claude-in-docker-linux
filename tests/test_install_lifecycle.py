@@ -191,7 +191,20 @@ class InstallLifecycleTests(unittest.TestCase):
             import csv, json, os, sys
             from pathlib import Path
             args = sys.argv[1:]
-            if args[0] == 'run':
+            if args[0] == 'version':
+                print('linux/amd64')
+            elif args[:2] == ['image', 'inspect']:
+                print('linux/amd64', args[-1].split(':')[1], 'sha256:' + 'a' * 64)
+            elif args[0] == 'create':
+                assert args[args.index('--platform') + 1] == 'linux/amd64' and args[-1] == 'resolve', args
+                print('b' * 64)
+            elif args[0] == 'start':
+                assert args == ['start', '--attach', 'b' * 64], args
+                print('Fetching signed index (fixture)', file=sys.stderr)
+                print('5.11492.5')
+            elif args[0] == 'rm':
+                assert args == ['rm', '--force', 'b' * 64], args
+            elif args[0] == 'run':
                 assert args[-4:] == ['lock', '--platform', 'linux-x64,linux-arm64', '--bump'] or args[-3:] == ['lock', '--platform', 'linux-x64,linux-arm64'], args
                 fields = next(csv.reader([args[args.index('--mount') + 1]]))
                 root = Path(next(v[7:] for v in fields if v.startswith('source=')))
@@ -206,6 +219,7 @@ class InstallLifecycleTests(unittest.TestCase):
                 root = Path(build['context'])
                 assert (root / 'image/mise-user.lock').read_text() == {example_lock!r}
                 assert b'kubectl' in (root / 'image/mise-user.toml').read_bytes()
+                assert (root / 'image/claude-desktop.version').read_text() == '5.11492.5\\n'
                 with Path({str(self.docker_log)!r}).open('a') as log:
                     log.write(json.dumps({{'service': args[-1], 'context': str(root)}}) + '\\n')
             '''))
@@ -220,8 +234,15 @@ class InstallLifecycleTests(unittest.TestCase):
         self.assertEqual(profile.with_suffix('.lock').read_bytes(), lock_before)
         self.write(profile.parent / 'claude-code.version', '2.1.326\n')
         diagnostic = diagnostic.replace(f'claude-docker: tools: {profile}',
-                                        f'claude-docker: Claude Code version: 2.1.326\nclaude-docker: tools: {profile}')
+                                        'claude-docker: Claude Code version: 2.1.326\n'
+                                        'claude-docker: Checking the Docker daemon for Claude Desktop release resolution.\n'
+                                        'claude-docker: Checking the cached Claude Desktop resolver image for linux/amd64.\n'
+                                        'claude-docker: Checking fresh signed Anthropic package metadata for Claude Desktop.\n'
+                                        'Fetching signed index (fixture)\n'
+                                        'claude-docker: Claude Desktop version: 5.11492.5\n'
+                                        f'claude-docker: tools: {profile}')
         self.run_command(self.command, 'build', '--all', expected_stderr=diagnostic)
+        self.assertEqual((profile.parent / 'claude-desktop.version').read_text(), '5.11492.5\n')
         builds = [json.loads(line) for line in self.docker_log.read_text().splitlines()]
         self.assertEqual([build['service'] for build in builds], ['claude-cli', 'claude-desktop'])
         self.assertEqual(builds[0]['context'], builds[1]['context'])

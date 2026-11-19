@@ -8,3 +8,5 @@
 !image/mise-user.toml
 !image/mise-user.lock
 !image/claude-code.version
+!image/claude-desktop.version
+!image/claude-desktop-apt.sh

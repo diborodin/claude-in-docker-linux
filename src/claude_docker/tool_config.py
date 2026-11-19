@@ -9,6 +9,9 @@ import tomllib
 from .paths import HostPaths
 
 
+MISE_IMAGE = 'jdxcode/mise:2026.11.5'
+
+
 @dataclass(frozen=True)
 class ToolProfile:
     source: Path

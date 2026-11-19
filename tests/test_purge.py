@@ -264,6 +264,18 @@ class PurgeTests(unittest.TestCase):
                 else:
                     self.assertEqual(pin.stat().st_mode & 0o777, 0o000)
 
+    def test_purge_preserves_desktop_pin_and_its_resolved_alias(self):
+        paths = self.layout.host_paths
+        target = self.write(paths.state_dir / 'saved-desktop-version', '1:5.10-1\n')
+        pin = paths.config_dir / 'claude-desktop.version'
+        pin.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        pin.symlink_to(target)
+        report = self.purge(yes=True)
+        self.assertIn(pin, report.retained)
+        self.assertIn(target, report.retained)
+        self.assertEqual(pin.readlink(), target)
+        self.assertEqual(target.read_text(), '1:5.10-1\n')
+
     def test_purge_retains_unreadable_customize_script_without_opening_it(self):
         hook = self.write(self.layout.host_paths.config_dir / 'customize.sh', 'invalid Bash (')
         hook.chmod(0o000)

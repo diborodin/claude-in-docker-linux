@@ -222,10 +222,8 @@ class ImageAssetTests(unittest.TestCase):
         self.assertEqual(stages["desktop-runtime"]["image"], "common")
         self.assertEqual(stages["desktop"]["image"], "desktop-runtime")
         runtime = " ".join(value for _, value in stages["desktop-runtime"]["instructions"])
-        for required in ("claude-desktop", "openbox", "fonts-", "libx11", "libgtk"):
+        for required in ("openbox", "fonts-", "libx11", "libgtk", "xdg-desktop-portal"):
             self.assertIn(required, runtime)
-        self.assertIn("https://downloads.claude.ai/claude-desktop/key.asc", runtime)
-        self.assertIn("https://downloads.claude.ai/claude-desktop/apt/stable", runtime)
         self.assertIn("<decor>no</decor>", runtime)
         self.assertIn("<maximized>yes</maximized>", runtime)
         for name in ("cli", "desktop"):
@@ -240,8 +238,31 @@ class ImageAssetTests(unittest.TestCase):
             self.assertEqual(users[-1], "${CLAUDE_USER}")
         # Symmetric tool instructions must not drift between products.
         tool_ops = lambda name: [(op, value) for op, value in stages[name]["instructions"]
-                                if op in ("COPY", "RUN")]
+                                if op in ("COPY", "RUN") and 'dpkg -i' not in value]
         self.assertEqual(tool_ops("cli"), tool_ops("desktop"))
+
+    def test_desktop_package_installation_is_late_and_has_no_network(self):
+        stages = self.stages()
+        desktop = stages['desktop']['instructions']
+        runtime = stages['desktop-runtime']['instructions']
+        package = stages.get('claude-desktop-package')
+        self.assertIsNotNone(package, 'Desktop package stage is missing')
+        self.assertIn(('COPY', 'image/claude-desktop.version /tmp/claude-desktop.version'),
+                      package['instructions'])
+        self.assertIn(('COPY', '--from=mise /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt'),
+                      package['instructions'])
+        self.assertFalse(any(op == 'RUN' and ' bootstrap' in value for op, value in package['instructions']))
+        self.assertFalse(any(re.search(r'\sclaude-desktop(?:\s|$)|downloads\.claude\.ai|dpkg -i', value)
+                             for op, value in runtime if op == 'RUN'))
+        customization = next(i for i, (op, value) in enumerate(desktop)
+                             if op == 'RUN' and 'mise install' in value)
+        install = next(i for i, (op, value) in enumerate(desktop)
+                       if op == 'RUN' and 'dpkg -i' in value)
+        self.assertLess(customization, install)
+        self.assertIn('--network=none', desktop[install][1])
+        self.assertIn('from=claude-desktop-package', desktop[install][1])
+        self.assertFalse(any('claude-desktop-package' in value for _, value in
+                             stages['cli']['instructions']))
 
     def test_baseline_neutral_user_input_is_valid_toml(self):
         run = next(value for op, value in self.stages()['cli']['instructions']
@@ -309,8 +330,9 @@ class ImageAssetTests(unittest.TestCase):
         allowed = {pattern[1:] for pattern in patterns[1:] if pattern.startswith("!")}
         self.assertEqual(allowed, {"Dockerfile", "image/mise.toml", "image/mise.lock", "image/customize.sh",
                                    "image/mise-user.toml", "image/mise-user.lock", "image/customize-user.sh",
-                                   "image/claude-code.version"})
-        self.assertEqual(len(patterns), 9)
+                                   "image/claude-code.version", "image/claude-desktop.version",
+                                   "image/claude-desktop-apt.sh"})
+        self.assertEqual(len(patterns), 11)
         for denied in (".git/config", ".claude/credentials.json", ".aws/credentials", "docs/private.md",
                        "workspace/secret", "image/secret", "README.md", "image/customize.example.sh"):
             self.assertFalse(any(fnmatch.fnmatchcase(denied, pattern.rstrip("/")) for pattern in allowed), denied)

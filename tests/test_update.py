@@ -18,9 +18,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from claude_docker import installer
 from claude_docker.installer import InstallLayout, install_release
 from claude_docker.manifest import InstallManifest, InstallationRegistry
+from claude_docker.uninstall import uninstall_user
 
 
 CODE_VERSION_FILES = {'image/claude-code.version', 'src/claude_docker/claude_version.py'}
+DESKTOP_VERSION_FILES = {'image/claude-desktop.version', 'image/claude-desktop-apt.sh',
+                         'src/claude_docker/desktop_version.py', 'src/claude_docker/version_pin.py'}
+DESKTOP_RESOLVER_FILE = 'src/claude_docker/desktop_resolver.py'
 CUSTOMIZE_FILES = {'src/claude_docker/customize.py', 'image/customize.example.sh'}
 
 
@@ -108,6 +112,54 @@ class UpdateTests(InstallFixture):
         self.install('0.3.5')
         self.assert_command_works('0.3.5')
 
+    def test_historical_dynamic_seccomp_bundle_can_upgrade_or_be_reinstalled(self):
+        for replacement in ('0.3.7', '0.3.8'):
+            with self.subTest(replacement=replacement):
+                env = dict(self.env, HOME=str(self.root / f'home-{replacement}'),
+                           XDG_DATA_HOME=str(self.root / replacement),
+                           XDG_CONFIG_HOME=str(self.root / f'config-{replacement}'))
+                self.layout = InstallLayout.user(env)
+                self.install('0.3.7')
+                user_inputs = [self.layout.host_paths.config_dir / name for name in
+                               ('claude-code.version', 'claude-desktop.version', 'customize.sh', 'mise.toml')]
+                user_inputs[0].parent.mkdir(mode=0o700, parents=True)
+                for path, value in zip(user_inputs, (b'2.2.99\n', b'2:5.10-1\n', b'#!/bin/bash\n', b'[tools]\n')):
+                    path.write_bytes(value)
+                before = [self.snapshot(path) for path in user_inputs]
+                desktop_files = DESKTOP_VERSION_FILES | {DESKTOP_RESOLVER_FILE}
+                old = self.trim_release_inventory(desktop_files, '0.3.7')
+                self.assertEqual(len(old['files']), 43)
+                if replacement == '0.3.7':
+                    with self.assertRaisesRegex(ValueError, 'Release version collision'):
+                        self.install(replacement)
+                    with patch.dict(os.environ, env, clear=True):
+                        uninstall_user(self.layout)
+                    self.assertFalse(self.layout.release_dir('0.3.7').exists())
+                updated = self.install(replacement)
+                self.assertEqual({str(item.path) for item in updated.files},
+                                 {item['path'] for item in old['files']} | desktop_files)
+                self.assertEqual([self.snapshot(path) for path in user_inputs], before)
+                self.assert_command_works(replacement)
+
+    def test_historical_desktop_bundle_can_upgrade_or_be_reinstalled(self):
+        for replacement in ('0.3.7', '0.3.8'):
+            with self.subTest(replacement=replacement):
+                env = dict(self.env, HOME=str(self.root / f'home-{replacement}'),
+                           XDG_DATA_HOME=str(self.root / replacement),
+                           XDG_CONFIG_HOME=str(self.root / f'config-{replacement}'))
+                self.layout = InstallLayout.user(env)
+                installed = self.install('0.3.7')
+                self.assertIn(DESKTOP_RESOLVER_FILE, {str(item.path) for item in installed.files})
+                old = self.trim_release_inventory({DESKTOP_RESOLVER_FILE}, '0.3.7')
+                self.assertEqual(len(old['files']), 47)
+                if replacement == '0.3.7':
+                    with self.assertRaisesRegex(ValueError, 'Release version collision'):
+                        self.install(replacement)
+                    with patch.dict(os.environ, env, clear=True):
+                        uninstall_user(self.layout)
+                self.install(replacement)
+                self.assert_command_works(replacement)
+
     def test_historical_inventory_survives_new_policy_assets(self):
         new = {'src/claude_docker/tool_config.py', 'src/claude_docker/image_tools.py', 'LICENSE', 'src/claude_docker/seccomp.py',
                'security/desktop-seccomp-v0.2.4-linux-amd64.json',
@@ -151,7 +203,7 @@ class UpdateTests(InstallFixture):
         hook.write_bytes(b'untouched user script')
         before = self.snapshot(hook)
         manifest = self.install('0.3.1')
-        self.assertEqual(len(manifest.files), 43)
+        self.assertEqual(len(manifest.files), 48)
         self.assertEqual(self.snapshot(hook), before)
         self.assert_command_works('0.3.1')
 
@@ -164,14 +216,15 @@ class UpdateTests(InstallFixture):
         pin.write_bytes(b'  2.2.99\n')
         before = self.snapshot(pin)
         manifest = self.install('0.3.4')
-        self.assertEqual(len(manifest.files), 43)
+        self.assertEqual(len(manifest.files), 48)
         self.assertEqual(self.snapshot(pin), before)
         shipped = self.layout.release_dir('0.3.4') / 'image/claude-code.version'
         self.assertEqual(shipped.read_bytes(), b'latest\n')
         self.assert_command_works('0.3.4')
 
     def test_incomplete_new_policy_inventory_is_rejected(self):
-        cases = [{'image/claude-code.version'}, {'src/claude_docker/claude_version.py'},
+        cases = [{name} for name in sorted(DESKTOP_VERSION_FILES)]
+        cases += [{'image/claude-code.version'}, {'src/claude_docker/claude_version.py'},
                  CODE_VERSION_FILES | {'src/claude_docker/customize.py'}, {'src/claude_docker/customize.py'}, {'image/customize.example.sh'},
                  {'src/claude_docker/tool_config.py'}, {'src/claude_docker/image_tools.py'},
                  {'src/claude_docker/seccomp.py'},
@@ -201,7 +254,7 @@ class UpdateTests(InstallFixture):
         before = {path: self.snapshot(path) for path in files}
         with patch.dict(os.environ, dict(self.env, CLAUDE_MISE_CONFIG_FILE=str(files[2])), clear=True):
             manifest = self.install('0.3.0')
-        self.assertEqual(len(manifest.files), 43)
+            self.assertEqual(len(manifest.files), 48)
         for path in files:
             self.assertEqual(self.snapshot(path), before[path])
             self.assertNotIn(str(path), {str(item.path) for item in manifest.files})

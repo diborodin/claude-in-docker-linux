@@ -101,18 +101,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                               'claude-docker cleanup inner-docker --yes'))
     inner.add_argument('--yes', action='store_true', help='Confirm permanent deletion without an interactive prompt.')
     for name, summary, details, examples in (
-        ('build', 'Build the CLI image using the build cache.',
-         'Default: CLI image only. --desktop and --all are mutually exclusive.\n'
-         'The first build saves the latest Claude Code version. Later builds use the saved version.\n'
-         'Runs your optional customize.sh as root before Claude Code is copied.\n'
+        ('build', 'Build selected images using the build cache.',
+         'Default: CLI image only. --desktop or --update-desktop selects Desktop unless --all is set.\n'
+         'First builds save the latest versions for the selected images. Later builds use the saved versions.\n'
+         'Runs your optional customize.sh as root before installing Desktop and copying Claude Code.\n'
          'Stop existing containers after building to use the new image.',
-         ('claude-docker build', 'claude-docker build --desktop', 'claude-docker build --all --update-claude')),
-        ('rebuild', 'Build the CLI image with fresh base images and no cache.',
-         'Default: CLI image only. --desktop and --all are mutually exclusive.\n'
-         'The first build saves the latest Claude Code version. Later builds use the saved version.\n'
-         'Runs your optional customize.sh as root before Claude Code is copied.\n'
+         ('claude-docker build', 'claude-docker build --update-desktop',
+          'claude-docker build --all --update-claude --update-desktop')),
+        ('rebuild', 'Build selected images with fresh base images and no cache.',
+         'Default: CLI image only. --desktop or --update-desktop selects Desktop unless --all is set.\n'
+         'First builds save the latest versions for the selected images. Later builds use the saved versions.\n'
+         'Runs your optional customize.sh as root before installing Desktop and copying Claude Code.\n'
          'Stop existing containers after rebuilding to use the new image.',
-         ('claude-docker rebuild', 'claude-docker rebuild --desktop', 'claude-docker rebuild --all --update-claude')),
+         ('claude-docker rebuild', 'claude-docker rebuild --update-desktop',
+          'claude-docker rebuild --all --update-claude --update-desktop')),
         ('pull', 'Pull external images used by the selected Docker mode.',
          'Used for optional inner Docker in Sysbox mode. Does not build Claude images.\n'
          'In docker_mode=none there are no external images to pull.',
@@ -128,6 +130,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             targets.add_argument('--all', action='store_true', help='Build both CLI and Desktop images.')
             child.add_argument('--update-claude', action='store_true',
                                help='Check the latest Claude Code release and save the selected version before building.')
+            child.add_argument('--update-desktop', action='store_true',
+                               help='Save the latest signed Desktop package version and build Desktop. '
+                                    'Combine with --all to build both images.')
     desktop = command(commands, 'desktop', 'Launch Claude Desktop in a private nested display.',
                       details='Put launcher options before application arguments. Use -- to separate them.\n'
                               'The default policy enables the sandbox and uses manual clipboard transfers.\n'
@@ -334,9 +339,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command in ('build', 'rebuild'):
                 rebuild = args.command == 'rebuild'
                 services = (('claude-cli', 'claude-desktop') if args.all else
-                            ('claude-desktop',) if args.desktop else ('claude-cli',))
-                with image_build_inputs(project.program_dir, paths, os.environ,
-                                        update_claude=args.update_claude) as context:
+                            ('claude-desktop',) if args.desktop or args.update_desktop else ('claude-cli',))
+                with image_build_inputs(project.program_dir, paths, os.environ, runner=project.runner,
+                                        include_desktop='claude-desktop' in services,
+                                        update_claude=args.update_claude, update_desktop=args.update_desktop) as context:
                     for service in services:
                         project.build(service, pull=rebuild, no_cache=rebuild, build_context=context)
             elif args.command == 'pull':
