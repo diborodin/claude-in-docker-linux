@@ -109,8 +109,11 @@ USER root
 COPY image/mise.toml /etc/mise/config.toml
 COPY image/mise.lock /etc/mise/mise.lock
 COPY image/mise.toml image/mise-user.* /opt/user-tools/
+# The baseline file keeps this optional COPY valid in a clean source checkout.
+COPY image/mise.toml image/mise-user-graphs* /opt/user-tools/.mise/locks/
 COPY image/customize.sh image/customize-user.* /usr/local/lib/claude-image/
 RUN set -eu; \
+    rm -f /opt/user-tools/.mise/locks/mise.toml; \
     if [ -f /opt/user-tools/mise-user.toml ]; then \
       mv /opt/user-tools/mise-user.toml /opt/user-tools/config.toml; \
     else printf '%s\n' '[tools]' > /opt/user-tools/config.toml; fi; \
@@ -169,8 +172,11 @@ USER root
 COPY image/mise.toml /etc/mise/config.toml
 COPY image/mise.lock /etc/mise/mise.lock
 COPY image/mise.toml image/mise-user.* /opt/user-tools/
+# The baseline file keeps this optional COPY valid in a clean source checkout.
+COPY image/mise.toml image/mise-user-graphs* /opt/user-tools/.mise/locks/
 COPY image/customize.sh image/customize-user.* /usr/local/lib/claude-image/
 RUN set -eu; \
+    rm -f /opt/user-tools/.mise/locks/mise.toml; \
     if [ -f /opt/user-tools/mise-user.toml ]; then \
       mv /opt/user-tools/mise-user.toml /opt/user-tools/config.toml; \
     else printf '%s\n' '[tools]' > /opt/user-tools/config.toml; fi; \

@@ -161,11 +161,12 @@ def run_checks(config: AppConfig, *, smoke: bool, runner: CommandRunner,
     return results
 
 
-def lock_tools(project: ComposeProject, *, base: bool = False, bump: bool = False) -> None:
+def lock_tools(project: ComposeProject, *, base: bool = False, bump: bool = False,
+               report_paths: bool = False) -> None:
     """Resolve the invoking user's profile, or explicitly the contributor base."""
     from .image_tools import lock_image_tools
     lock_image_tools(project.program_dir, project.paths, project.runner, os.environ,
-                     base=base, bump=bump)
+                     base=base, bump=bump, report_paths=report_paths)
 
 
 def cleanup_inner_docker(project: ComposeProject, *, yes: bool) -> None:

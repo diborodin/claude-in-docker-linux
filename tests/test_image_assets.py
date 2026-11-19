@@ -331,8 +331,8 @@ class ImageAssetTests(unittest.TestCase):
         self.assertEqual(allowed, {"Dockerfile", "image/mise.toml", "image/mise.lock", "image/customize.sh",
                                    "image/mise-user.toml", "image/mise-user.lock", "image/customize-user.sh",
                                    "image/claude-code.version", "image/claude-desktop.version",
-                                   "image/claude-desktop-apt.sh"})
-        self.assertEqual(len(patterns), 11)
+                                   "image/claude-desktop-apt.sh", "image/mise-user-graphs/**/uv.lock", "image/mise-user-graphs/**/pyproject.toml"})
+        self.assertEqual(len(patterns), 13)
         for denied in (".git/config", ".claude/credentials.json", ".aws/credentials", "docs/private.md",
                        "workspace/secret", "image/secret", "README.md", "image/customize.example.sh"):
             self.assertFalse(any(fnmatch.fnmatchcase(denied, pattern.rstrip("/")) for pattern in allowed), denied)

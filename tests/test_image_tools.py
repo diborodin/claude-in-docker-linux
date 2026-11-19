@@ -1,12 +1,14 @@
 """Locking snapshots exact inputs and publishes only validated output."""
 from contextlib import redirect_stderr
 import csv
+import hashlib
 import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tomllib
 import unittest
 from unittest.mock import patch
 from tests.test_tool_config import ProfileFixture, NATIVE_LOCK
@@ -38,6 +40,102 @@ class SnapshotFixture(ProfileFixture):
 
 
 class ImageToolsTests(SnapshotFixture):
+    def test_python_helper_cache_is_platform_bound_and_excludes_host_credentials(self):
+        from claude_docker.image_tools import _python_lock_image
+        test = self
+        class HelperRunner:
+            built = False
+            calls = []
+            def run(inner, argv, **kwargs):
+                inner.calls.append(list(argv))
+                test.assertNotIn('PRIVATE_TOKEN', kwargs['env'])
+                if argv[1] == 'version':
+                    return subprocess.CompletedProcess(argv, 0, 'linux/arm64\n', '')
+                if argv[1:3] == ['image', 'inspect']:
+                    revision = argv[-1].split(':')[1]
+                    return subprocess.CompletedProcess(argv, 0 if inner.built else 1,
+                        'linux/arm64 ' + revision + ' sha256:' + 'a' * 64 if inner.built else '',
+                        '' if inner.built else 'No such image')
+                test.assertEqual(argv[1], 'build')
+                test.assertEqual(argv[argv.index('--platform') + 1], 'linux/arm64')
+                context = Path(argv[-1])
+                test.assertEqual([p.name for p in context.iterdir()], ['Dockerfile'])
+                text = (context / 'Dockerfile').read_text()
+                test.assertIn('python:3.14-slim', text)
+                test.assertIn('ghcr.io/astral-sh/uv:', text)
+                inner.built = True
+                return subprocess.CompletedProcess(argv, 0, '', '')
+        runner = HelperRunner()
+        env = dict(self.env, PRIVATE_TOKEN='secret-sentinel')
+        first = _python_lock_image(ROOT, runner, env)
+        second = _python_lock_image(ROOT, runner, env)
+        self.assertEqual(first, second)
+        self.assertEqual(sum(call[1] == 'build' for call in runner.calls), 1)
+
+    def test_interrupted_graph_write_can_be_retried(self):
+        from claude_docker.image_tools import _publish_graphs
+        relative = Path('.mise/locks/claude-docker/test/uv.lock')
+        code = '''import os,sys
+from pathlib import Path
+from claude_docker.image_tools import _publish_graphs
+original = os.fdopen
+class CrashWriter:
+    def __init__(self, stream): self.stream=stream
+    def __enter__(self): return self
+    def __exit__(self,*args): self.stream.close()
+    def write(self, raw):
+        self.stream.write(raw[:3]); self.stream.flush(); os._exit(42)
+os.fdopen=lambda *args,**kwargs: CrashWriter(original(*args,**kwargs))
+_publish_graphs(Path(sys.argv[1]), {Path(sys.argv[2]): b'complete graph'})
+'''
+        result = subprocess.run([sys.executable, '-B', '-c', code, str(self.root), str(relative)],
+                                env=dict(os.environ, PYTHONPATH=str(ROOT / 'src')), timeout=5)
+        self.assertEqual(result.returncode, 42)
+        _publish_graphs(self.root, {relative: b'complete graph'})
+        self.assertEqual((self.root / relative).read_bytes(), b'complete graph')
+
+    def test_python_lock_publication_preserves_old_graph_and_build_snapshots_exact_files(self):
+        from claude_docker.image_tools import lock_image_tools, image_build_inputs
+        from claude_docker.tool_config import read_user_tools
+        self.seed_code_version()
+        source = self.write('[tools]\n"pipx:ansible-core"="latest"\n')
+        class PythonRunner:
+            revision = 1
+            def run(inner, argv, **kwargs):
+                fields = next(csv.reader([argv[argv.index('--mount') + 1]]))
+                root = Path(next(value[7:] for value in fields if value.startswith('source=')))
+                relative = '.mise/locks/pipx-ansible-core/2.22.0'
+                if (root / 'mise.lock').exists():
+                    relative = tomllib.loads((root / 'mise.lock').read_text())['tools']['pipx:ansible-core'][0]['uv']['path']
+                directory = root / relative
+                directory.mkdir(parents=True, exist_ok=True)
+                graph = f'version=1\nrevision={inner.revision}\n'.encode()
+                (directory / 'uv.lock').write_bytes(graph)
+                (directory / 'pyproject.toml').write_text('[project]\nname="mise-tool"\nversion="0.0.0"\n')
+                digest = hashlib.sha256(graph).hexdigest()
+                (root / 'mise.lock').write_text('lockfile_version=4\n[[tools."pipx:ansible-core"]]\n'
+                    'version="2.22.0"\nbackend="pipx:ansible-core"\nspecifiers=["latest"]\n'
+                    'uv={path="' + relative + '",digest="sha256:' + digest + '"}\n')
+                return subprocess.CompletedProcess(argv, 0, '', '')
+        runner = PythonRunner()
+        with patch('claude_docker.image_tools._python_lock_image', return_value='helper', create=True):
+            lock_image_tools(ROOT, self.paths, runner, self.env)
+            first = read_user_tools(self.paths, self.env, require_lock=True)
+            runner.revision = 2
+            lock_image_tools(ROOT, self.paths, runner, self.env, bump=True)
+        second = read_user_tools(self.paths, self.env, require_lock=True)
+        self.assertNotEqual(first.lock_bytes, second.lock_bytes)
+        for name, raw in first.graphs.items():
+            self.assertEqual((source.parent / name).read_bytes(), raw)
+        with image_build_inputs(ROOT, self.paths, self.env) as context:
+            expected = {context / 'image/mise-user-graphs' / Path(*name.parts[2:]): raw
+                        for name, raw in second.graphs.items()}
+            self.assertEqual({p: p.read_bytes() for p in (context / 'image/mise-user-graphs').rglob('*') if p.is_file()}, expected)
+        project = next(name for name in second.graphs if name.name == 'pyproject.toml')
+        (source.parent / project).write_bytes(second.graphs[project] + b'# changed project')
+        with self.assertRaisesRegex(ValueError, 'digest'):
+            read_user_tools(self.paths, self.env, require_lock=True)
+
     def setUp(self):
         super().setUp()
         self.stderr = io.StringIO()
@@ -186,6 +284,8 @@ class ImageToolsTests(SnapshotFixture):
             lock_image_tools(ROOT, self.paths, LockRunner(self, fail=True), self.env)
         self.assertEqual(p.with_suffix('.lock').read_bytes(), old)
         self.assertTrue(old)
+        self.assertNotIn(str(p), self.stderr.getvalue())
+        lock_image_tools(ROOT, self.paths, LockRunner(self), self.env, report_paths=True)
         self.assertIn(str(p), self.stderr.getvalue())
         self.assertNotIn('private-output', self.stderr.getvalue())
 

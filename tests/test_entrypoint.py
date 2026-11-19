@@ -39,6 +39,45 @@ class EntrypointTests(unittest.TestCase):
         self.assertRegex(version.stdout, r"claude-docker \d+\.\d+\.\d+")
         self.assertFalse(self.docker_marker.exists())
 
+    def test_debug_help_and_version_add_paths_without_changing_stdout_or_using_docker(self):
+        broken = self.root / 'broken.toml'
+        broken.write_text('invalid TOML [ secret-sentinel')
+        env = dict(self.env, HOME=str(self.root), CLAUDE_CONFIG_FILE=str(broken),
+                   XDG_CONFIG_HOME=str(self.root / 'config'),
+                   XDG_STATE_HOME=str(self.root / 'state'))
+        for arguments in (('--help',), ('--version',), ('desktop', '--help'),
+                          ('check', '--help'), ('tools', 'lock', '--help')):
+            plain = self.run_launcher(*arguments, env=env)
+            self.assertEqual(plain.returncode, 0, plain.stderr)
+            self.assertEqual(plain.stderr, '')
+            for flag in ('-d', '--debug'):
+                with self.subTest(flag=flag, arguments=arguments):
+                    result = self.run_launcher(flag, *arguments, env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, plain.stdout)
+                    for path in (str(broken), 'image/mise.toml', 'customize.sh'):
+                        self.assertIn(path, result.stderr)
+                    self.assertEqual(result.stderr.count('launcher version:'), 1)
+                    self.assertNotIn('secret-sentinel', result.stdout + result.stderr)
+        self.assertFalse(self.docker_marker.exists())
+        self.assertFalse((self.root / 'config').exists())
+        self.assertFalse((self.root / 'state').exists())
+
+    def test_no_command_shows_help_and_paths_only_with_debug_without_docker(self):
+        for args in ((), ('-d',), ('--debug',)):
+            result = self.run_launcher(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, self.run_launcher('--help').stdout)
+            self.assertIn('usage:', result.stdout)
+            self.assertEqual('launcher version:' in result.stderr, bool(args))
+            if args:
+                self.assertIn('config.toml', result.stderr)
+                self.assertIn('mise.toml', result.stderr)
+                self.assertIn('customize.sh', result.stderr)
+            else:
+                self.assertEqual(result.stderr, '')
+        self.assertFalse(self.docker_marker.exists())
+
     def test_installed_symlink_finds_package_from_an_unrelated_cwd(self):
         link = self.root / "installed-command"
         link.symlink_to(EXECUTABLE)

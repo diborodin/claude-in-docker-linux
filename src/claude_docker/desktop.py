@@ -672,6 +672,7 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
             if synchronize:
                 warn_sync()
                 sync.start(runtime, host_display=os.environ['DISPLAY'])
+            project.report_versions(container, desktop=True)
             print('Claude Desktop is already running; its environment is unchanged. '
                   'Existing per-run sandbox, clipboard and container security choices persist until '
                   'restart or stop. Use desktop --restart to apply current host credentials, '
@@ -709,6 +710,7 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
             prepare_runtime()
             project.up('claude-desktop')
         container = project.container_id('claude-desktop')
+        project.report_versions(container, desktop=True)
         socket_check = docker_exec_argv(container, ['test', '-S', f'/tmp/.X11-unix/X{runtime.display}'],
                                        workdir=config.container.home, env_names=(),
                                        interactive=False, tty=False)

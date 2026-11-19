@@ -86,7 +86,7 @@ Desktop image also passed the Chromium-policy GUI test on Docker 29.10.0.
 6. Open `~/.config/claude-docker/config.toml` in your editor.
 7. Replace the example mount list with existing workspace roots. For example,
    set `mounts = ["~/work/git"]` in the existing `[container]` table.
-8. If you want optional kubectl 1.36 and AWS CLI v2, create a user tool profile:
+8. To add optional tools and apt packages, create a user tool profile:
 
    ```bash
    claude-docker tools init
@@ -105,7 +105,7 @@ Desktop image also passed the Chromium-policy GUI test on Docker 29.10.0.
    ```
 
    Review or edit `~/.config/claude-docker/customize.sh` before you build.
-   The example installs `checkbashisms`. It runs as root inside the build.
+   The example installs `checkbashisms` and Google Cloud CLI as root.
    This script needs no `tools lock`.
 10. Check the host and build the CLI image:
 
@@ -126,6 +126,14 @@ The default installation stores versioned program files under
 `config init` refuses to overwrite an existing file.
 
 ## Start Claude
+
+Run `claude-docker` without arguments or with `--help` to show full help.
+This does not read configuration or use Docker, and it creates no files. To show paths for a command, put the global `-d` or `--debug` option before it.
+Add `-d` before `--help` or `--version` to also list paths. Normal starts
+report versions without listing paths. Build-input paths include base
+and personal mise TOML/lock files and customize scripts; missing files are marked.
+These host files can differ from those used to build an existing container.
+Diagnostics use stderr. Without `-d`, help and version output stays concise.
 
 After you complete the installation and image build:
 
@@ -474,17 +482,31 @@ Installed commands support optional user tools. Create a private example once:
 claude-docker tools init
 ```
 
-Edit `~/.config/claude-docker/mise.toml`. The example installs kubectl from
-the 1.36 series and AWS CLI v2.
-To also add an Ubuntu package, use:
+Edit `~/.config/claude-docker/mise.toml`. The example includes kubectl 1.36,
+AWS CLI v2, Helm, Terraform, and Ansible Core. Remove entries you do not need.
+Its optional apt packages are build-essential (includes make), wget,
+openssh-client, rsync, postgresql-client, mysql-client, and redis-tools.
+Mise Python 3.14 supports locked Ansible. uv stays in the baseline.
+Example profile:
 
 ```toml
 [tools]
 kubectl = "1.36"
 aws-cli = "2"
+helm = "latest"
+terraform = "latest"
+python = "3.14"
+"pipx:ansible-core" = "latest"
 
 [bootstrap.packages]
-"apt:tree" = "latest"
+"apt:build-essential" = "latest"
+"apt:wget" = "latest"
+"apt:openssh-client" = "latest"
+"apt:rsync" = "latest"
+"apt:postgresql-client" = "latest"
+"apt:mysql-client" = "latest"
+"apt:redis-tools" = "latest"
+# "apt:tree" = "latest"
 ```
 
 The lock selects an exact patch version for each version request.
@@ -499,8 +521,8 @@ claude-docker claude
 ```
 
 Use `build` for CLI or `build --desktop` for Desktop. Tools are installed in
-system paths outside mounted HOME. Manual container installations are lost
-when the container is removed. Both images include these default tools:
+system paths outside mounted HOME. Manual installations are lost when containers
+are removed. Both images include these default tools:
 
 | Installer | Tools |
 | --- | --- |
@@ -510,7 +532,11 @@ when the container is removed. Both images include these default tools:
 Miller provides `mlr`. Difftastic provides `difft`. Kubectl remains optional.
 
 The sibling `mise.lock` pins artifacts and checksums for `linux-x64` and
-`linux-arm64`. Ordinary locking preserves matching resolutions. Use
+`linux-arm64`. Python tools use `pipx:` and retain their dependency graphs
+under `.mise/locks/claude-docker/` beside the profile. Keep this directory with
+the profile and its sibling lock; builds verify its digests. The first Python lock
+prepares a cached helper with Python and uv. The host needs neither tool.
+Ordinary locking preserves matching resolutions. Use
 `claude-docker tools lock --bump` to advance requests. Builds require a matching
 lock and never create or refresh one. Comments and apt edits keep tool locks
 valid. An apt-only profile needs no artifact lock; apt packages are not pinned
@@ -520,13 +546,13 @@ by this lock. The shipped base and user artifact locks are separate.
 selects an absolute or `~/` file, independently of `CLAUDE_CONFIG_FILE`.
 For example, `~/tools/custom.toml` uses the sibling `~/tools/custom.lock`.
 A missing default profile adds no tools. An explicitly selected missing file
-is an error. Init never overwrites a file. The profile and lock
-survive updates, normal uninstall, and purge, including custom locations.
+is an error. Init never overwrites a file. The profile, lock,
+and Python lock directories survive updates, uninstall, and purge, including custom locations.
 
 Only `[tools]` and apt-only `[bootstrap.packages]` are supported. Use a single
 version string or a version/options table with scalar backend options.
 Requests must be additive. Baseline removal, other sections, unsupported
-managers, templates, core controls, and dependency sidecars are rejected.
+managers, templates, core controls, and non-Python dependency sidecars are rejected.
 Checksum and locked-install policy stay program-controlled. Docker receives
 private snapshots of exact build inputs, without sending your HOME,
 configuration directory, or workspace.
@@ -589,7 +615,7 @@ file inside the container.
 
 ### Run a personal build script
 
-Create a private script that installs `checkbashisms` on the next image build:
+Create a private example for `checkbashisms` and Google Cloud CLI:
 
 ```bash
 claude-docker customize init
@@ -598,7 +624,9 @@ claude-docker customize init
 Edit `~/.config/claude-docker/customize.sh`. `XDG_CONFIG_HOME` changes the
 default directory. The script runs as root after tool setup in each image
 build, before the Claude artifacts are installed. The example installs to
-`/usr/local/bin`, outside mounted HOME.
+`/usr/local/bin`, outside mounted HOME. Google Cloud CLI uses the official
+`packages.cloud.google.com` apt repository with a scoped signing key.
+Remove example sections you do not need. Init does not change existing scripts.
 Run `claude-docker build --all`, run `claude-docker stop`, then start Claude.
 Artifact locks apply to the mise profile. Keep secrets out of your script.
 Docker receives its contents. Environment forwarding applies when Claude starts.

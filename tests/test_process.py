@@ -44,6 +44,18 @@ class DockerExecArgvTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
+    def test_global_debug_preserves_code_debug_argument(self):
+        for flag in ('-d', '--debug'):
+            with self.subTest(flag=flag):
+                result = subprocess.run([sys.executable, str(ROOT / 'claude-docker'), flag,
+                                         'claude', '-d', '--model', 'literal value'],
+                                        env=self.env, cwd=self.caller, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 37, result.stderr)
+                self.assertIn(str(self.config_file), result.stderr)
+                command = self.commands()[-1]
+                self.assertEqual(command[command.index('container-one') + 1:],
+                                 ['claude', '-d', '--model', 'literal value'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -65,6 +77,10 @@ args = sys.argv[1:]
 with (Path(os.environ['HOME']) / 'commands.jsonl').open('a') as stream:
     stream.write(json.dumps(args) + '\\n')
 if args[0] == 'exec':
+    if args[-2:] == ['claude', '--version']:
+        assert 'TOKEN' not in os.environ and '--env' not in args
+        print('2.1.328 (Claude Code)')
+        sys.exit(0)
     expected = json.loads((Path(os.environ['HOME']) / 'expected.json').read_text())
     for name, digest in expected.items():
         if hashlib.sha256(os.environ.get(name, '').encode()).hexdigest() != digest:
@@ -110,7 +126,7 @@ if 'ps' in args:
         commands = self.commands()
         self.assertEqual(commands[0][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
         self.assertEqual(commands[1][-3:], ['ps', '-q', 'claude-cli'])
-        self.assertEqual(commands[2], ['exec', '-i', '--workdir', str(self.caller), '--env', 'TOKEN',
+        self.assertEqual(commands[-1], ['exec', '-i', '--workdir', str(self.caller), '--env', 'TOKEN',
                                       '--env', 'EMPTY', 'container-one', 'claude', '--help', '--model',
                                       'model name', '--', '-p', 'literal; $(false)'])
         override = (self.runtime_base / 'claude-docker/compose.none.json').read_text()
@@ -137,11 +153,11 @@ if 'ps' in args:
         self.write_config(mode='sysbox')
         self.assertEqual(self.invoke().returncode, 37)
         commands = self.commands()
-        self.assertEqual(commands[3][-1], 'down')
-        self.assertIn(str(ROOT / 'compose.yaml'), commands[3])
-        self.assertNotIn(str(ROOT / 'compose.sysbox.yaml'), commands[3])
-        self.assertEqual(commands[4][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
-        self.assertIn(str(ROOT / 'compose.sysbox.yaml'), commands[4])
+        transition = next(i for i, command in enumerate(commands) if command[-1] == 'down')
+        self.assertIn(str(ROOT / 'compose.yaml'), commands[transition])
+        self.assertNotIn(str(ROOT / 'compose.sysbox.yaml'), commands[transition])
+        self.assertEqual(commands[transition + 1][-6:], ['up', '-d', '--no-build', '--pull', 'never', 'claude-cli'])
+        self.assertIn(str(ROOT / 'compose.sysbox.yaml'), commands[transition + 1])
 
     def test_missing_or_empty_required_fails_before_any_docker_process(self):
         for value in (None, ''):
@@ -194,7 +210,8 @@ if 'ps' in args:
                 self.assertNotIn('task5-unique-secret-sentinel', repr(calls))
                 self.assertNotIn('task5-unique-secret-sentinel', repr(diagnostics.call_args_list))
                 self.assertEqual(stdout.getvalue(), '')
-                self.assertEqual(stderr.getvalue(), f'claude-docker: config: {self.config_file}\n')
+                self.assertNotIn(str(self.config_file), stderr.getvalue())
+                self.assertIn('launcher version:', stderr.getvalue())
 
     def test_compose_exception_diagnostic_does_not_expose_selected_values(self):
         stdout, stderr = io.StringIO(), io.StringIO()

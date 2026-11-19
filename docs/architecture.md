@@ -119,10 +119,12 @@ difftastic, scc, and duckdb with checksums for both architectures. Kubectl is op
 launcher configuration; its suffix is replaced by `.lock` for the sibling lock.
 Missing default profiles add no declarative tools. Missing explicit sources are errors
 for tool/build operations, but do not prevent teardown.
+The optional example includes Helm, Terraform, Ansible Core, and database/network/build
+clients from apt. It requests mise Python 3.14 for locked Ansible; uv stays in the baseline. Init does not modify an existing personal profile.
 
 Personal profiles accept additive `[tools]` and apt-only `[bootstrap.packages]`.
-Other sections, baseline removal, unsupported managers, and dependency sidecars
-are rejected. The program controls locked installs and checksum policy.
+Python packages use the `pipx:` backend with a version string. Other sections,
+baseline removal, unsupported managers, and non-Python dependency sidecars are rejected. The program controls locked installs and checksum policy.
 `tools lock` runs pinned mise in Docker using only private input snapshots and
 filtered Docker transport variables. Matching resolutions remain stable;
 `--bump` refreshes them. Separate base and user native locks contain artifacts
@@ -130,6 +132,22 @@ and checksums for linux-x64 and linux-arm64. Apt-only profiles need no artifact
 lock; apt requests are not artifact-pinned. Comments and apt edits do not
 invalidate unchanged tool requests. Contributor `tools lock --base` is limited
 to source/development checkouts. Old base-profile edits need manual migration.
+
+Python requests use a separate cached native helper built from official
+`python:3.14-slim`, pinned mise, and the baseline-pinned official uv image.
+The helper has no host tools or credentials mounted. A helper revision includes
+its Dockerfile and daemon platform; reuse validates its label and immutable ID.
+Only Python requests use this helper; other locks still use the pinned mise image.
+Native `uv.lock` and `pyproject.toml` dependency sidecars are read below the profile
+directory without following links. Only referenced files enter snapshots. Native
+uv digests are checked; published directories also address both files by SHA-256.
+Complete files are fsynced before exclusive publication. Graphs publish first,
+then `mise.lock` is atomically replaced after checking unchanged host inputs.
+A failed or interrupted resolution keeps the previous lock and graph usable.
+Old graph directories are retained to avoid breaking another lock or reader.
+Graph directories survive update, uninstall, and purge. Removing the final Python
+request leaves old graphs inert; it does not block future locks or builds.
+Python sidecars are user-only; the baseline keeps binary artifact locks.
 
 Build never resolves or refreshes locks. It validates and snapshots exact inputs
 in a private temporary context shared by both products for `build --all`.
@@ -144,7 +162,21 @@ script as `image/customize-user.sh`. Both targets run it as root with Bash
 strict mode after package setup, mise install, shim creation, and the baseline
 hook. A failing script fails the build. An absent script skips this step.
 The example extracts `checkbashisms` into `/usr/local/bin` for use with a
-mounted HOME.
+mounted HOME and installs Google Cloud CLI from `packages.cloud.google.com`.
+Its dedicated apt keyring is scoped to that repository with `signed-by`.
+Neither example changes the shipped baseline.
+
+Without arguments the launcher prints full help to stdout, without resolving
+configuration paths, parsing TOML, creating state, accessing Docker, or resolving
+application releases. Config/build-input paths are reported only with debug.
+The global `-d`/`--debug` prefix reports the same paths before parsing, including
+when help/version actions exit early. Their normal stdout remains unchanged;
+ordinary commands do not list them. Missing optional files are marked. These describe current host inputs, which can differ from the inputs
+used for an existing image. Starts always query actual container versions:
+Code uses `claude --version`; Desktop uses the installed package version from
+`dpkg-query`, without starting Electron. Each probe has a five-second deadline,
+filtered Docker transport environment and no forwarded application credentials.
+Probe failure prints `unavailable` and does not block the application launch.
 
 `compose.yaml` defines the CLI and Desktop services. The launcher supplies build
 identity and a runtime override with validated mounts and selected settings.

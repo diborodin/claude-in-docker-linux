@@ -7,6 +7,8 @@
 !image/customize-user.sh
 !image/mise-user.toml
 !image/mise-user.lock
+!image/mise-user-graphs/**/uv.lock
+!image/mise-user-graphs/**/pyproject.toml
 !image/claude-code.version
 !image/claude-desktop.version
 !image/claude-desktop-apt.sh

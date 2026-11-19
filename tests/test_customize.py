@@ -21,6 +21,14 @@ from claude_docker.paths import resolve_host_paths
 
 
 class CustomizeTests(unittest.TestCase):
+    def test_google_cloud_example_uses_scoped_repository_key(self):
+        script = (ROOT / 'image/customize.example.sh').read_text()
+        self.assertIn('https://packages.cloud.google.com/apt/doc/apt-key.gpg', script)
+        self.assertIn('signed-by=/etc/apt/keyrings/google-cloud.gpg', script)
+        self.assertIn('google-cloud-cli', script)
+        self.assertIn('/usr/local/bin/checkbashisms', script)
+        self.assertNotIn('apt-key add', script)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -133,7 +141,7 @@ class CustomizeTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.env, clear=True), redirect_stderr(self.errors), \
                 patch.object(cli.CommandRunner, 'run', run):
-            self.assertEqual(cli.main(['build', '--all']), 1)
+            self.assertEqual(cli.main(['-d', 'build', '--all']), 1)
         self.assertEqual(services, ['claude-cli', 'claude-desktop'])
         self.assertEqual(contexts[0], contexts[1])
         self.assertTrue(all(not target.exists() for target in contexts + overrides))

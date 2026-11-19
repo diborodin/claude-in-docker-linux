@@ -1,5 +1,6 @@
 """User tool profiles validate without host mise or network."""
 import os
+import hashlib
 from pathlib import Path
 import stat
 import sys
@@ -29,6 +30,42 @@ class ProfileFixture(unittest.TestCase):
         p.write_text(text); return p
 
 class ProfileTests(ProfileFixture):
+    def test_python_graphs_are_user_only(self):
+        with self.assertRaisesRegex(ValueError, 'user'):
+            self.api().validate_declarations(b'[tools]\n"pipx:ansible-core"="latest"\n', Path('base.toml'), base=True)
+
+    def test_python_graphs_are_required_digest_checked_and_cannot_escape_profile(self):
+        api = self.api()
+        source = self.write('[tools]\n"pipx:ansible-core"="latest"\n')
+        graph = b'version = 1\n[[package]]\nname="ansible-core"\nversion="2.22.0"\n'
+        digest = hashlib.sha256(graph).hexdigest()
+        raw = ('lockfile_version=4\n[[tools."pipx:ansible-core"]]\nversion="2.22.0"\n'
+               'backend="pipx:ansible-core"\nspecifiers=["latest"]\n'
+               'uv={path=".mise/locks/pipx-ansible-core/2.22.0",digest="sha256:' + digest + '"}\n')
+        lock = source.with_suffix('.lock')
+        lock.write_text(raw)
+        with self.assertRaises(ValueError):
+            api.read_user_tools(self.paths, self.env, require_lock=True)
+        directory = source.parent / '.mise/locks/pipx-ansible-core/2.22.0'
+        directory.mkdir(parents=True)
+        (directory / 'uv.lock').write_bytes(graph)
+        (directory / 'pyproject.toml').write_text('[project]\nname="mise-tool"\nversion="0.0.0"\n')
+        profile = api.read_user_tools(self.paths, self.env, require_lock=True)
+        self.assertEqual(len(profile.graphs), 2)
+        (directory / 'uv.lock').write_bytes(graph + b'# changed')
+        with self.assertRaisesRegex(ValueError, 'digest'):
+            api.read_user_tools(self.paths, self.env, require_lock=True)
+        (directory / 'uv.lock').write_bytes(graph)
+        for path in ('../outside', '/tmp/outside', '.mise/locks/../secret'):
+            lock.write_text(raw.replace('.mise/locks/pipx-ansible-core/2.22.0', path))
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                api.read_user_tools(self.paths, self.env, require_lock=True)
+        lock.write_text(raw)
+        (directory / 'uv.lock').unlink()
+        (directory / 'uv.lock').symlink_to(source)
+        with self.assertRaises(ValueError):
+            api.read_user_tools(self.paths, self.env, require_lock=True)
+
     def test_paths_missing_defaults_and_explicit_selection(self):
         api = self.api()
         self.assertEqual(api.resolve_user_tools_paths(self.paths, self.env),
@@ -47,7 +84,11 @@ class ProfileTests(ProfileFixture):
         api = self.api(); p = api.init_user_tools(self.paths, self.env)
         self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
         self.assertEqual(tomllib.loads(p.read_text())['tools'], {
-            'kubectl': '1.36', 'aws-cli': '2'})
+            'kubectl': '1.36', 'aws-cli': '2', 'helm': 'latest',
+            'terraform': 'latest', 'python': '3.14', 'pipx:ansible-core': 'latest'})
+        self.assertEqual(tomllib.loads(p.read_text())['bootstrap']['packages'], {
+            'apt:' + name: 'latest' for name in ('build-essential', 'wget', 'openssh-client',
+                'rsync', 'postgresql-client', 'mysql-client', 'redis-tools')})
         with self.assertRaises(FileExistsError): api.init_user_tools(self.paths, self.env)
         p.unlink(); p.symlink_to(self.root / 'missing')
         with self.assertRaises(FileExistsError): api.init_user_tools(self.paths, self.env)
@@ -87,7 +128,7 @@ class ProfileTests(ProfileFixture):
                         operation()
                     self.assertNotIn('private', str(caught.exception))
                 self.assertEqual(api.retained_user_tools_paths(self.paths, env),
-                                 (default, default.with_suffix('.lock')))
+                                 (default, default.with_suffix('.lock'), default.parent / '.mise/locks'))
 
     def test_native_lock_requires_matching_requests_platforms_and_checksums(self):
         api = self.api(); p = self.write('[tools]\nkubectl="latest"\n')
@@ -109,7 +150,7 @@ class ProfileTests(ProfileFixture):
     def test_nonregular_profiles_and_sidecars_rejected(self):
         api = self.api(); p = self.write('[tools]\nkubectl="latest"')
         (p.parent / '.mise/locks').mkdir(parents=True)
-        with self.assertRaises(ValueError): api.read_user_tools(self.paths, self.env, require_lock=False)
+        self.assertIsNotNone(api.read_user_tools(self.paths, self.env, require_lock=False))
         import shutil
         shutil.rmtree(p.parent / '.mise'); p.unlink(); p.mkdir()
         with self.assertRaises(ValueError): api.read_user_tools(self.paths, self.env, require_lock=False)
@@ -137,7 +178,8 @@ class ProfileTests(ProfileFixture):
         lock = p.with_suffix('.lock'); lock.mkdir()
         with self.assertRaises(ValueError): api.read_user_tools(self.paths, self.env, require_lock=False)
         self.assertEqual(set(api.retained_user_tools_paths(self.paths, self.env)),
-                         {self.root / '.config/claude-docker/mise.toml', self.root / '.config/claude-docker/mise.lock', p, lock})
+                         {self.root / '.config/claude-docker/mise.toml', self.root / '.config/claude-docker/mise.lock', p, lock,
+                          self.root / '.config/claude-docker/.mise/locks', p.parent / '.mise/locks'})
 
     def test_native_scalar_backend_options_use_string_bindings(self):
         api = self.api()
@@ -202,7 +244,8 @@ class ProfileTests(ProfileFixture):
              patch.object(Path, 'stat', side_effect=AssertionError('profile stat')):
             for env, expected in cases:
                 with self.subTest(selection=env.get('CLAUDE_MISE_CONFIG_FILE')):
-                    self.assertEqual(api.retained_user_tools_paths(self.paths, env), expected)
+                    self.assertEqual(api.retained_user_tools_paths(self.paths, env),
+                                     expected + tuple(parent / '.mise/locks' for parent in dict.fromkeys(p.parent for p in expected)))
         for env, _ in cases[:-1]:
             with self.subTest(operation_selection=env.get('CLAUDE_MISE_CONFIG_FILE')):
                 with self.assertRaisesRegex(ValueError, 'distinct'):

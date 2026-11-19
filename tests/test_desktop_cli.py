@@ -50,6 +50,10 @@ class DesktopRunner:
             code = self.openbox_exit
         if 'test' in argv and '-S' in argv:
             code = self.socket_exit
+        if argv[-2:] == ['claude', '--version']:
+            output = '2.1.328 (Claude Code)\n'
+        if 'dpkg-query' in argv:
+            output = '5.11492.5'
         if 'claude-desktop' in argv and argv[:2] == ['docker', 'exec'] and '-d' in argv:
             code = self.app_exit
             self.running = not code and not self.disappear
@@ -213,7 +217,8 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         self.assertNotIn('--no-sandbox', detached[1])
         self.assertEqual(detached[1][detached[1].index('--workdir') + 1], '/home/tester')
         self.assertEqual(detached[1][detached[1].index('--env') + 1], 'SECRET')
-        self.assertEqual(self.stderr.getvalue(), '')
+        self.assertIn('Claude Desktop version:', self.stderr.getvalue())
+        self.assertNotIn('WARNING:', self.stderr.getvalue())
         checks = [argv for argv, _ in self.runner.calls if 'test' in argv]
         self.assertEqual(checks[0][-3:], ['test', '-S', '/tmp/.X11-unix/X25'])
 
@@ -247,7 +252,8 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
         command = self.app_commands()[-1]
         self.assertEqual(command[command.index('claude-desktop'):],
                          ['claude-desktop', '--', '--no-sandbox'])
-        self.assertEqual(self.stderr.getvalue(), '')
+        self.assertIn('Claude Desktop version:', self.stderr.getvalue())
+        self.assertNotIn('WARNING:', self.stderr.getvalue())
 
     def test_display_starts_before_any_runtime_override_is_written(self):
         def start(*, keyboard):
@@ -771,10 +777,20 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
 
 
 class DesktopParserTests(unittest.TestCase):
+    def test_global_debug_preserves_literal_desktop_arguments(self):
+        with patch.object(cli, 'launch_desktop', return_value=0) as launch, \
+                patch.object(cli, 'load_config', return_value=object()), \
+                patch.object(cli, '_report_build_sources'), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['-d', 'desktop', '--restart', '--', '-d', '--help']), 0)
+        self.assertTrue(launch.call_args.kwargs['restart'])
+        self.assertEqual(launch.call_args.kwargs['app_args'], ['-d', '--help'])
+
     def test_desktop_flags_and_literal_app_arguments_are_routed(self):
         with patch.object(cli, 'launch_desktop', return_value=23, create=True) as launch, \
                 patch.object(cli, 'load_config', return_value=object()), \
-                patch.object(cli, 'resolve_host_paths'):
+                patch.object(cli, 'resolve_host_paths'), \
+                patch.object(cli, '_report_build_sources'):
             try:
                 result = cli.main(['desktop', '--restart', '--clipboard-sync', '--no-sandbox', '--', '--help', 'literal; $(false)'])
             except SystemExit as error:
@@ -786,7 +802,8 @@ class DesktopParserTests(unittest.TestCase):
     def test_no_sandbox_after_separator_remains_app_argument(self):
         with patch.object(cli, 'launch_desktop', return_value=0, create=True) as launch, \
                 patch.object(cli, 'load_config', return_value=object()), \
-                patch.object(cli, 'resolve_host_paths'):
+                patch.object(cli, 'resolve_host_paths'), \
+                patch.object(cli, '_report_build_sources'):
             self.assertEqual(cli.main(['desktop', '--', '--no-sandbox']), 0)
         self.assertFalse(launch.call_args.kwargs['no_sandbox'])
         self.assertEqual(launch.call_args.kwargs['app_args'], ['--no-sandbox'])

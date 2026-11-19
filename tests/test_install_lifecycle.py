@@ -70,7 +70,11 @@ class InstallLifecycleTests(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0,
                          f'{arguments!r}\nstdout: {result.stdout}\nstderr: {result.stderr}')
-        self.assertEqual(result.stderr, expected_stderr)
+        lines = result.stderr.splitlines(keepends=True)
+        details = [line for line in lines if ' (build input): ' in line or line.startswith('claude-docker: launcher version: ')]
+        if details:
+            self.assertEqual(len(details), 8)
+        self.assertEqual(''.join(line for line in lines if line not in details), expected_stderr)
         return result.stdout
 
     def snapshot(self, root):
@@ -224,13 +228,15 @@ class InstallLifecycleTests(unittest.TestCase):
                     log.write(json.dumps({{'service': args[-1], 'context': str(root)}}) + '\\n')
             '''))
         docker.chmod(0o755)
-        self.run_command(self.command, 'tools', 'init', expected_stderr=f'claude-docker: tools: {profile}\n')
+        self.run_command(self.command, 'tools', 'init')
+        # This lifecycle fixture pins a small personal profile independently of the init example.
+        profile.write_text('[tools]\nkubectl = "1.36"\naws-cli = "2"\n')
         diagnostic = (f'claude-docker: config: {profile.parent / "config.toml"} '
                       '(not found; using defaults and environment overrides)\n'
                       f'claude-docker: tools: {profile}\n')
-        self.run_command(self.command, 'tools', 'lock', expected_stderr=diagnostic)
+        self.run_command(self.command, '-d', 'tools', 'lock', expected_stderr=diagnostic)
         lock_before = profile.with_suffix('.lock').read_bytes()
-        self.run_command(self.command, 'tools', 'lock', expected_stderr=diagnostic)
+        self.run_command(self.command, '-d', 'tools', 'lock', expected_stderr=diagnostic)
         self.assertEqual(profile.with_suffix('.lock').read_bytes(), lock_before)
         self.write(profile.parent / 'claude-code.version', '2.1.326\n')
         diagnostic = diagnostic.replace(f'claude-docker: tools: {profile}',
@@ -241,7 +247,7 @@ class InstallLifecycleTests(unittest.TestCase):
                                         'Fetching signed index (fixture)\n'
                                         'claude-docker: Claude Desktop version: 5.11492.5\n'
                                         f'claude-docker: tools: {profile}')
-        self.run_command(self.command, 'build', '--all', expected_stderr=diagnostic)
+        self.run_command(self.command, '-d', 'build', '--all', expected_stderr=diagnostic)
         self.assertEqual((profile.parent / 'claude-desktop.version').read_text(), '5.11492.5\n')
         builds = [json.loads(line) for line in self.docker_log.read_text().splitlines()]
         self.assertEqual([build['service'] for build in builds], ['claude-cli', 'claude-desktop'])
@@ -312,7 +318,7 @@ with patch('os.getuid', return_value=int(uid)), patch('pwd.getpwuid', return_val
                           '(not found; using defaults and environment overrides)\n'
                           'claude-docker: Claude Code version: 2.1.326\n'
                           f'claude-docker: tools: {selected}\n')
-            self.run_command(sys.executable, '-c', harness, release, uid, home, 'build',
+            self.run_command(sys.executable, '-c', harness, release, uid, home, '-d', 'build',
                              expected_stderr=diagnostic)
             expected.append((str(uid), profile))
         self.env = original_env

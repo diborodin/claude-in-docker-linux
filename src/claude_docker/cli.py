@@ -25,6 +25,50 @@ def _report_config_source(path: Path, found: bool) -> None:
     print(f'claude-docker: config: {path}{suffix}', file=sys.stderr)
 
 
+def _report_build_sources(paths, env, program_dir: Path) -> None:
+    """Describe paths without parsing config, resolving releases or using Docker."""
+    from .customize import user_customize_path
+    from .tool_config import _derive_user_tools_paths
+
+    try:
+        source, lock, _ = _derive_user_tools_paths(paths, env)
+        personal = (('user mise (build input)', source), ('user mise lock (build input)', lock),
+                    ('user mise Python locks (build input)', source.parent / '.mise/locks'))
+    except ValueError:
+        personal = ()
+        print('claude-docker: user mise paths unavailable: invalid CLAUDE_MISE_CONFIG_FILE', file=sys.stderr)
+    for label, path in (
+        ('base mise (build input)', program_dir / 'image/mise.toml'),
+        ('base mise lock (build input)', program_dir / 'image/mise.lock'),
+        *personal,
+        ('base customize (build input)', program_dir / 'image/customize.sh'),
+        ('user customize (build input)', user_customize_path(paths)),
+    ):
+        suffix = '' if path.exists() else ' (not found)'
+        print(f'claude-docker: {label}: {path}{suffix}', file=sys.stderr)
+
+
+def _report_paths(*, include_version: bool) -> None:
+    """Report paths before help/version actions without loading configuration."""
+    if include_version:
+        print(f'claude-docker: launcher version: {__version__}', file=sys.stderr)
+    try:
+        paths = resolve_host_paths(os.environ, os.getuid(), create_runtime=False)
+        try:
+            source = resolve_config_file(env=os.environ, paths=paths)
+            if 'CLAUDE_CONFIG_FILE' in os.environ and not source.exists():
+                print(f'claude-docker: config: {source} (not found)', file=sys.stderr)
+            else:
+                _report_config_source(source, source.exists())
+        except (ValueError, OSError):
+            print('claude-docker: config path unavailable', file=sys.stderr)
+        program_dir = resolve_program_dir(Path(__file__).resolve().parents[2] / 'claude-docker', os.environ)
+        _report_build_sources(paths, os.environ, program_dir)
+    except (ValueError, OSError):
+        # Diagnostics must not block teardown or an otherwise usable image.
+        print('claude-docker: configuration paths unavailable', file=sys.stderr)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments == ['_clipboard-worker']:
@@ -33,6 +77,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="claude-docker", description="Run Claude Code and Desktop in Docker on Linux.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="Show configuration/build paths, also with --help or --version (before COMMAND).")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", title="commands", metavar="COMMAND")
     command_parsers = []
@@ -171,7 +217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         '\n'.join('  ' + line for line in child.format_usage().removeprefix('usage: ').rstrip().splitlines())
         for child in command_parsers)
     parser.epilog = (
-        'Command usage (put options after the command):\n' + overview + '\n\n'
+        'Command usage (command options go after COMMAND; global -d goes before COMMAND):\n' + overview + '\n\n'
         'For option descriptions, run: claude-docker COMMAND --help\n'
         'For example: claude-docker check --help\n\n'
         'Examples:\n'
@@ -181,23 +227,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         '  claude-docker desktop --restart\n\n'
         'All arguments after claude go to Claude Code; claude --help runs application help.\n'
         'Use desktop -- --help for Desktop application help.')
-    # Everything after the subcommand belongs to Claude, including --help and
-    # leading options. argparse must never consume or reinterpret those tokens.
+    # Only leading global flags belong to the launcher. Preserve application tails.
+    prefix = []
+    while arguments[:1] in (['-d'], ['--debug']):
+        prefix.append(arguments.pop(0))
+    if prefix:
+        _report_paths(include_version=True)
     claude_args = arguments[1:] if arguments[:1] == ['claude'] else []
     desktop_args = []
     if arguments[:1] == ['desktop']:
         boundary = 1
         while boundary < len(arguments) and arguments[boundary] in ('--restart', '--clipboard-sync', '--no-sandbox'):
             boundary += 1
-        # A leading --help is launcher help; after an app argument it stays literal.
         if arguments[boundary:] == ['--help']:
             boundary += 1
         desktop_args = arguments[boundary:]
         if desktop_args[:1] == ['--']:
             desktop_args = desktop_args[1:]
-        args = parser.parse_args(arguments[:boundary])
+        args = parser.parse_args(prefix + arguments[:boundary])
     else:
-        args = parser.parse_args(arguments[:1] if arguments[:1] == ['claude'] else arguments)
+        args = parser.parse_args(prefix + (arguments[:1] if arguments[:1] == ['claude'] else arguments))
+    if args.command is None:
+        parser.print_help()
+    if not prefix and args.debug:
+        _report_paths(include_version=args.debug)
+    elif not args.debug and args.command in ('build', 'rebuild', 'claude', 'desktop'):
+        print(f'claude-docker: launcher version: {__version__}', file=sys.stderr)
+    if args.command is None:
+        return 0
     if args.command == 'uninstall':
         from .installer import InstallLayout
         from .uninstall import reject_shared_system, uninstall_user, print_report
@@ -228,7 +285,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (ValueError, OSError) as error:
             sys.stderr.write(f'claude-docker: {error}\n')
             return 1
-        print(f'claude-docker: tools: {destination}', file=sys.stderr)
         print(f'Created tool profile: {destination}')
     elif args.command == 'customize' and args.customize_command == 'init':
         from .customize import init_user_customize
@@ -260,7 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             account = pwd.getpwuid(uid)
             config = load_config(env=os.environ, paths=paths,
                                  account=AccountInfo(account.pw_name, uid, os.getgid(), Path(account.pw_dir)),
-                                 report_source=_report_config_source)
+                                 report_source=None)
             runner = CommandRunner()
             if args.command == 'check':
                 results = run_checks(config, smoke=args.smoke, runner=runner,
@@ -271,7 +327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1 if any(result.status == 'error' for result in results) else 0
             project = ComposeProject(config, paths, (), runner)
             if args.command == 'tools':
-                lock_tools(project, base=args.base, bump=args.bump)
+                lock_tools(project, base=args.base, bump=args.bump, report_paths=args.debug)
             else:
                 cleanup_inner_docker(project, yes=args.yes)
         except (ValueError, OSError) as error:
@@ -291,7 +347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 account = pwd.getpwuid(uid)
                 config = load_config(env=os.environ, paths=paths,
                                      account=AccountInfo(account.pw_name, uid, os.getgid(), Path(account.pw_dir)),
-                                     report_source=_report_config_source)
+                                     report_source=None)
                 project = ComposeProject(config, paths, (), runner)
             except (ValueError, OSError, KeyError):
                 failures.append('Configuration or Compose project setup failed')
@@ -323,7 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = load_config(env=os.environ, paths=paths,
                                  account=AccountInfo(account.pw_name, uid, os.getgid(),
                                                      Path(account.pw_dir)),
-                                 report_source=_report_config_source)
+                                 report_source=None)
             if args.command == 'desktop':
                 return launch_desktop(config, restart=args.restart, clipboard_sync=args.clipboard_sync,
                                       no_sandbox=args.no_sandbox, app_args=desktop_args)
@@ -333,16 +389,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == 'claude':
                 workdir = container_workdir(Path.cwd(), mounts, config.container.home)
                 project.up('claude-cli')
+                container = project.container_id('claude-cli')
+                project.report_versions(container)
                 return project.exec('claude-cli', ['claude', *claude_args], workdir=workdir,
                                     env_names=env_names, interactive=True,
-                                    tty=sys.stdin.isatty() and sys.stdout.isatty())
+                                    tty=sys.stdin.isatty() and sys.stdout.isatty(), container=container)
             elif args.command in ('build', 'rebuild'):
                 rebuild = args.command == 'rebuild'
                 services = (('claude-cli', 'claude-desktop') if args.all else
                             ('claude-desktop',) if args.desktop or args.update_desktop else ('claude-cli',))
                 with image_build_inputs(project.program_dir, paths, os.environ, runner=project.runner,
                                         include_desktop='claude-desktop' in services,
-                                        update_claude=args.update_claude, update_desktop=args.update_desktop) as context:
+                                        update_claude=args.update_claude, update_desktop=args.update_desktop,
+                                        report_paths=args.debug) as context:
                     for service in services:
                         project.build(service, pull=rebuild, no_cache=rebuild, build_context=context)
             elif args.command == 'pull':

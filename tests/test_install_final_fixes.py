@@ -369,9 +369,9 @@ class FinalInstallFixTests(unittest.TestCase):
         from tests.test_tool_config import NATIVE_LOCK
         (self.source / 'image/mise.toml').write_text('[tools]\nkubectl="latest"\n')
         (self.source / 'image/mise.lock').write_text(NATIVE_LOCK)
-        self.run_command(self.source / 'claude-docker', 'tools', 'lock', '--base', expected_stderr=notice)
+        self.run_command(self.source / 'claude-docker', '-d', 'tools', 'lock', '--base', expected_stderr=notice)
         self.run_command(self.source / 'install', '--dev')
-        self.run_command(self.command, 'tools', 'lock', '--base', expected_stderr=notice)
+        self.run_command(self.command, '-d', 'tools', 'lock', '--base', expected_stderr=notice)
         self.assertEqual(log.read_text().splitlines(), ['run', 'run'])
 
     def test_installed_user_and_system_user_lock_allowed_base_refused(self):
@@ -400,7 +400,12 @@ class FinalInstallFixTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(log.exists())
                 self.assertEqual(self.snapshot(installed), before)
+                self.assertNotIn(str(profile), result.stderr)
+                result = subprocess.run([str(command), '-d', 'tools', 'lock'],
+                                        env=user_env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(str(profile), result.stderr)
+                self.assertEqual(self.snapshot(installed), before)
                 log.unlink()
                 result = self.invoke('--uninstall', *arguments, prefix=prefix)
                 self.assertEqual(result.returncode, 0, result.stderr)

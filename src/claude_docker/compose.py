@@ -317,10 +317,34 @@ class ComposeProject:
         self.state.clear_mode()
         self.state.clear_pending()
 
+    def report_versions(self, container: str, *, desktop: bool = False) -> None:
+        """Best-effort version probes of the actual container, never the saved pins."""
+        probes = [('Claude Code', ['claude', '--version'])]
+        if desktop:
+            probes.append(('Claude Desktop', ['dpkg-query', '-W', '-f=${Version}', 'claude-desktop']))
+        for label, command in probes:
+            version = 'unavailable'
+            argv = docker_exec_argv(container, command, workdir=self.config.container.home,
+                                    env_names=(), interactive=False, tty=False)
+            try:
+                result = self.runner.run(argv, env=docker_environment(os.environ),
+                                         check=False, capture_output=True, timeout=5)
+                if result.returncode == 0 and isinstance(result.stdout, str) and len(result.stdout) <= 128:
+                    if label == 'Claude Desktop':
+                        from .desktop_version import _parse_version
+                        version = _parse_version(result.stdout.encode('utf-8'), 'container package database')
+                    else:
+                        match = re.fullmatch(r'([0-9]+\.[0-9]+\.[0-9]+)(?: \(Claude Code\))?\s*', result.stdout)
+                        if match:
+                            version = match[1]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            print(f'claude-docker: {label} version: {version}', file=sys.stderr)
+
     def exec(self, service: str, command: Sequence[str], *, workdir: Path,
              env_names: Sequence[str], interactive: bool, tty: bool,
-             detach: bool = False, capture_output: bool = False) -> int:
-        argv = docker_exec_argv(self.container_id(service), command, workdir=workdir,
+             detach: bool = False, capture_output: bool = False, container: str | None = None) -> int:
+        argv = docker_exec_argv(container if container is not None else self.container_id(service), command, workdir=workdir,
                                 env_names=env_names, interactive=interactive,
                                 tty=tty, detach=detach)
         # No env mapping: Docker reads selected names from the current launcher

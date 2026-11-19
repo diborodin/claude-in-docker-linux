@@ -181,6 +181,11 @@ class CodeResolverProcessTests(unittest.TestCase):
         self.assertIn('Requesting the latest Claude Code version over HTTPS.', logs)
         errors = [line for line in logs.splitlines() if not line.startswith((
             'claude-docker: config: ',
+            'claude-docker: launcher version: ',
+            'claude-docker: base mise ',
+            'claude-docker: user mise ',
+            'claude-docker: base customize ',
+            'claude-docker: user customize ',
             'claude-docker: Requesting ',
             'claude-docker: Reading ',
         ))]
@@ -253,8 +258,8 @@ class CodeResolverProcessTests(unittest.TestCase):
         for name in ('sitecustomize.py', 'claude_docker.py'):
             (self.root / name).write_text("raise AssertionError('untrusted startup')\n")
         layout = InstallLayout.user(self.env)
-        install_release(ROOT, layout, version='0.4.0')
-        program = layout.release_dir('0.4.0')
+        install_release(ROOT, layout, version='0.4.5')
+        program = layout.release_dir('0.4.5')
         with self.stderr.open('w') as stderr, self.start(stderr, 'environment', program) as process:
             stdout, _ = process.communicate(timeout=4)
             self.assertEqual(process.returncode, 0, self.stderr.read_text())

@@ -37,6 +37,50 @@ class RecordingRunner:
         return subprocess.CompletedProcess(argv, 0, self.stdout, '')
 
 
+class VersionReportingTests(unittest.TestCase):
+    def test_desktop_reports_full_debian_package_version(self):
+        project = object.__new__(ComposeProject)
+        project.config = type('Config', (), {'container': type('Container', (), {'home': Path('/home/tester')})()})()
+        project.runner = RecordingRunner(stdout='1:5.11492.5-2~ubuntu1\n')
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            project.report_versions('container-one', desktop=True)
+        self.assertIn('Claude Desktop version: 1:5.11492.5-2~ubuntu1', errors.getvalue())
+
+    def test_probes_actual_versions_with_timeout_without_application_credentials(self):
+        project = object.__new__(ComposeProject)
+        project.config = type('Config', (), {'container': type('Container', (), {'home': Path('/home/tester')})()})()
+        project.runner = RecordingRunner(stdout='2.1.328 (Claude Code)\n')
+        errors = io.StringIO()
+        with patch.dict(os.environ, {'AWS_SECRET_ACCESS_KEY': 'secret-sentinel'}, clear=True), redirect_stderr(errors):
+            project.report_versions('container-one', desktop=True)
+        self.assertIn('Claude Code version: 2.1.328', errors.getvalue())
+        self.assertIn('Claude Desktop version:', errors.getvalue())
+        self.assertEqual(len(project.runner.calls), 2)
+        for argv, kwargs in project.runner.calls:
+            self.assertEqual(argv[:2], ['docker', 'exec'])
+            self.assertNotIn('-e', argv)
+            self.assertNotIn('secret-sentinel', str((argv, kwargs)))
+            self.assertEqual(kwargs['timeout'], 5)
+            self.assertTrue(kwargs['capture_output'])
+
+    def test_failed_or_malformed_probes_are_nonfatal_and_do_not_echo_output(self):
+        project = object.__new__(ComposeProject)
+        project.config = type('Config', (), {'container': type('Container', (), {'home': Path('/home/tester')})()})()
+        errors = io.StringIO()
+        project.runner = RecordingRunner(stdout='secret-sentinel')
+        with redirect_stderr(errors):
+            project.report_versions('container-one')
+            project.runner.fail_operation = 'exec'
+            project.report_versions('container-one', desktop=True)
+        self.assertEqual(errors.getvalue().count('unavailable'), 3)
+        self.assertNotIn('secret-sentinel', errors.getvalue())
+        for error in (OSError('secret-sentinel'), subprocess.TimeoutExpired('docker', 5)):
+            with self.subTest(error=type(error)), patch.object(project.runner, 'run', side_effect=error), redirect_stderr(errors):
+                project.report_versions('container-one')
+        self.assertEqual(errors.getvalue().count('unavailable'), 5)
+
+
 class ComposeFixture:
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

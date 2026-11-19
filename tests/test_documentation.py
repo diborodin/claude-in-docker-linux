@@ -84,7 +84,7 @@ class DocumentationTests(unittest.TestCase):
     def test_version_matches_package_and_executable_from_unrelated_directory(self):
         version = (ROOT / 'VERSION').read_text().strip()
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$')
-        self.assertEqual(version, '0.4.0')
+        self.assertEqual(version, '0.4.5')
         self.assertEqual(__version__, version)
         with tempfile.TemporaryDirectory() as directory:
             env = {'HOME': directory, 'PATH': '', 'PYTHONDONTWRITEBYTECODE': '1'}
@@ -167,7 +167,7 @@ class DocumentationTests(unittest.TestCase):
         self.assertEqual(HEADINGS, re.findall(r'^## (.+)$', self.prose, re.M))
         self.assertEqual(1, len(re.findall(r'^# [^#]', self.prose, re.M)))
         # Allow the image update workflow in the compact manual.
-        self.assertLessEqual(len(self.text.splitlines()), 685)
+        self.assertLessEqual(len(self.text.splitlines()), 730)
         self.assertRegex(self.text, r'\]\((?:\./)?config\.example\.toml\)')
 
     def test_ordinary_install_and_cli_procedures_precede_optional_features(self):
@@ -297,7 +297,7 @@ class DocumentationTests(unittest.TestCase):
                                   'XDG_CONFIG_HOME', 'CLAUDE_CONFIG_FILE', 'mise.lock',
                                   'custom.toml', 'custom.lock', 'kubectl', 'apt:tree',
                                   'linux-x64', 'linux-arm64', 'dependency sidecars'])
-        self.assertRegex(update, r'(?is)profile and lock.*(?:updates).*uninstall.*purge')
+        self.assertRegex(update, r'(?is)profile, lock,.*(?:updates).*uninstall.*purge')
         self.assertRegex(update, r'(?is)apt-only.*no artifact lock')
         self.assertRegex(update, r'(?is)manual.*migrat')
         self.assertNotIn('Separate the base image tools from user tools', self.section('TODO'))
@@ -312,8 +312,9 @@ class DocumentationTests(unittest.TestCase):
             profile.write_text(samples[0])
             loaded = read_user_tools(paths, {}, require_lock=False)
             self.assertEqual(loaded.tools, {'kubectl': '1.36',
-                                             'aws-cli': '2'})
-            self.assertEqual(loaded.packages, {'apt:tree': 'latest'})
+                                             'aws-cli': '2', 'helm': 'latest', 'terraform': 'latest', 'python': '3.14', 'pipx:ansible-core': 'latest'})
+            self.assertEqual(loaded.packages, {'apt:' + name: 'latest' for name in
+                ('build-essential', 'wget', 'openssh-client', 'rsync', 'postgresql-client', 'mysql-client', 'redis-tools')})
 
     def test_removal_retention_consent_and_recovery(self):
         removal = self.section('Update or uninstall')
@@ -341,7 +342,8 @@ class DocumentationTests(unittest.TestCase):
                                              '!image/mise.lock', '!image/customize.sh',
                                              '!image/mise-user.toml', '!image/mise-user.lock',
                                              '!image/customize-user.sh', '!image/claude-code.version',
-                                             '!image/claude-desktop.version', '!image/claude-desktop-apt.sh'])
+                                             '!image/claude-desktop.version', '!image/claude-desktop-apt.sh',
+                                             '!image/mise-user-graphs/**/uv.lock', '!image/mise-user-graphs/**/pyproject.toml'])
 
     def test_repository_file_references_exist(self):
         references = set(re.findall(r'\]\(([^)]+)\)', self.text))
@@ -419,9 +421,11 @@ class DocumentationTests(unittest.TestCase):
                             patch.object(cli.CommandRunner, 'run', record_command):
                         self.assertEqual(cli.main(arguments), 0)
                     executions = [argv for argv in calls if 'exec' in argv]
-                    self.assertEqual(len(executions), 1)
-                    application = executions[0].index('fixture-container') + 1
-                    self.assertEqual(executions[0][application:], ['claude', *arguments[1:]])
+                    self.assertEqual(len(executions), 2)
+                    probe, application = executions
+                    self.assertEqual(probe[probe.index('fixture-container') + 1:], ['claude', '--version'])
+                    self.assertNotIn('--env', probe)
+                    self.assertEqual(application[application.index('fixture-container') + 1:], ['claude', *arguments[1:]])
 
     def test_documented_commands_match_real_parser_and_help(self):
         commands = self.documented_commands()
@@ -442,8 +446,11 @@ class DocumentationTests(unittest.TestCase):
 
             for executable, *arguments in commands:
                 with self.subTest(command=(executable, *arguments)):
+                    if arguments == ['--help']:
+                        self.assertIn('usage:', help_for(executable, []))
+                        continue  # argparse help exits before returning a namespace.
                     parsed_args, parsed = self.parse_without_action(executable, arguments)
-                    if executable == 'claude-docker':
+                    if executable == 'claude-docker' and arguments:
                         self.assertRegex(help_for(executable, []), rf'\b{re.escape(arguments[0])}\b')
                     if arguments[:1] == ['claude']:
                         self.assertEqual(parsed.command, 'claude')

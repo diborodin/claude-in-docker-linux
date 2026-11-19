@@ -1,6 +1,7 @@
 """Persistent, deliberately limited user image declarations (stdlib only)."""
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ class ToolProfile:
     tools: Mapping
     packages: Mapping
     explicit: bool
+    graphs: Mapping[Path, bytes] = field(default_factory=dict)
 
 
 def validate_distinct_tool_paths(source: Path, lock_path: Path) -> None:
@@ -65,6 +67,7 @@ def retained_user_tools_paths(paths: HostPaths, env: Mapping[str, str]) -> tuple
         files.extend(_derive_user_tools_paths(paths, env)[:2])
     except ValueError:
         pass
+    files.extend(parent / '.mise/locks' for parent in dict.fromkeys(path.parent for path in files))
     return tuple(dict.fromkeys(files))
 
 
@@ -116,9 +119,14 @@ def validate_declarations(raw: bytes, source: Path, *, base: bool = False) -> tu
                 or not isinstance(value, str) or not _safe_value(value)):
             raise ValueError(f'Only additive apt package requests are supported: {source}')
     for name, value in tools.items():
+        if base and name.startswith('pipx:'):
+            raise ValueError(f'Python dependency graphs are supported only in user profiles: {source}')
         if (not re.fullmatch(r'[A-Za-z0-9_./:@+-]+', name)
                 or name.split(':', 1)[0] in {'npm', 'pypi', 'pip', 'asdf', 'vfox'}):
             raise ValueError(f'Unsupported tool backend or dependency sidecars: {source}')
+        if name.startswith('pipx:') and (not re.fullmatch(r'pipx:[A-Za-z0-9][A-Za-z0-9_.-]*', name)
+                                       or not isinstance(value, str)):
+            raise ValueError(f'Python tools require a package name and version string: {source}')
         if isinstance(value, str):
             valid = _safe_value(value) and not value.startswith(('path:', 'system', 'ref:'))
         elif isinstance(value, dict):
@@ -157,6 +165,15 @@ def validate_lock(raw: bytes, tools: Mapping, path: Path) -> None:
         }
         if row.get('options', {}) != options:
             raise ValueError(f'Stale tool lock options: {path}; run tools lock')
+        if any(key in row for key in ('dependencies', 'dependency_graph', 'sidecar', 'aube')):
+            raise ValueError(f'Unsupported dependency sidecars: {path}')
+        if name.startswith('pipx:'):
+            if row['backend'] != name:
+                raise ValueError(f'Unexpected Python backend: {path}')
+            _python_graph_reference(row, path)
+            continue
+        if 'uv' in row or 'aube' in row:
+            raise ValueError(f'Unsupported dependency sidecar: {path}')
         for platform in ('linux-x64', 'linux-arm64'):
             artifact = row.get('platforms.' + platform, {})
             if (not isinstance(artifact, dict)
@@ -169,6 +186,64 @@ def validate_lock(raw: bytes, tools: Mapping, path: Path) -> None:
             raise ValueError(f'Dependency sidecars are unsupported: {path}')
 
 
+def _python_graph_reference(row: dict, path: Path) -> tuple[Path, str]:
+    graph = row.get('uv')
+    if not isinstance(graph, dict) or set(graph) != {'path', 'digest'}:
+        raise ValueError(f'Python tool requires a uv dependency graph: {path}; run tools lock')
+    value, digest = graph['path'], graph['digest']
+    if (not isinstance(value, str) or not re.fullmatch(r'\.mise/locks/[A-Za-z0-9_./+-]+', value)
+            or '..' in value.split('/') or '.' in value.split('/') or '//' in value
+            or value.endswith('/') or len(Path(value).parts) < 4
+            or not isinstance(digest, str) or not re.fullmatch(r'sha256:[a-f0-9]{64}', digest)):
+        raise ValueError(f'Invalid Python dependency graph reference: {path}')
+    return Path(value), digest
+
+
+def graph_file_bytes(root: Path, relative: Path) -> bytes:
+    """Read only below the profile directory; never follow sidecar symlinks."""
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        file = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        with os.fdopen(file, 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError('Python dependency graph file must be regular')
+            contents = stream.read(4 * 1024 * 1024 + 1)
+            if len(contents) > 4 * 1024 * 1024:
+                raise ValueError('Python dependency graph file is too large')
+            return contents
+    finally:
+        os.close(descriptor)
+
+
+def read_python_graphs(raw: bytes, tools: Mapping, path: Path, *, verify_address: bool = True) -> dict[Path, bytes]:
+    entries = _toml(raw, path).get('tools', {})
+    result = {}
+    for name in tools:
+        if not name.startswith('pipx:'):
+            continue
+        directory, digest = _python_graph_reference(entries[name][0], path)
+        try:
+            for filename in ('uv.lock', 'pyproject.toml'):
+                relative = directory / filename
+                result[relative] = graph_file_bytes(path.parent, relative)
+                _toml(result[relative], relative)
+        except OSError:
+            raise ValueError(f'Missing or unsafe Python dependency graph: {path}; run tools lock') from None
+        graph = result[directory / 'uv.lock'].replace(b'\r\n', b'\n')
+        if 'sha256:' + hashlib.sha256(graph).hexdigest() != digest:
+            raise ValueError(f'Python dependency graph digest mismatch: {path}; run tools lock')
+        if verify_address and directory.parent == Path('.mise/locks/claude-docker'):
+            files = {name.name: raw for name, raw in result.items() if name.parent == directory}
+            address = hashlib.sha256(b''.join(name.encode() + b'\0' + files[name] for name in sorted(files))).hexdigest()
+            if directory.name != address:
+                raise ValueError(f'Python project/lock digest mismatch: {path}; run tools lock')
+    return result
+
+
 def read_user_tools(paths: HostPaths, env: Mapping[str, str], *, require_lock: bool) -> ToolProfile | None:
     source, lock_path, explicit = resolve_user_tools_paths(paths, env)
     raw = _regular_bytes(source)
@@ -177,14 +252,22 @@ def read_user_tools(paths: HostPaths, env: Mapping[str, str], *, require_lock: b
             raise ValueError(f'Selected tool profile does not exist: {source}')
         return None
     tools, packages = validate_declarations(raw, source)
-    if (source.parent / '.mise/locks').exists() or (source.parent / '.mise/locks').is_symlink():
-        raise ValueError(f'Dependency sidecars are unsupported: {source}')
+    python = any(name.startswith('pipx:') for name in tools)
     lock = _regular_bytes(lock_path, lock=True)
+    graphs = {}
     if require_lock and tools:
         if lock is None:
             raise ValueError(f'Missing tool lock: {lock_path}; run tools lock')
         validate_lock(lock, tools, lock_path)
-    return ToolProfile(source, lock_path, raw, lock, tools, packages, explicit)
+        graphs = read_python_graphs(lock, tools, lock_path)
+    elif python and lock is not None:
+        # Repair a missing/stale graph through explicit tools lock, never build.
+        try:
+            validate_lock(lock, tools, lock_path)
+            graphs = read_python_graphs(lock, tools, lock_path)
+        except ValueError:
+            pass
+    return ToolProfile(source, lock_path, raw, lock, tools, packages, explicit, graphs)
 
 
 def init_user_tools(paths: HostPaths, env: Mapping[str, str]) -> Path:
@@ -192,5 +275,26 @@ def init_user_tools(paths: HostPaths, env: Mapping[str, str]) -> Path:
     source.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'wb') as stream:
-        stream.write(b'# Optional image tools. Run tools lock, then build --all.\n[tools]\nkubectl = "1.36"\naws-cli = "2"\n\n# Optional Ubuntu packages (not artifact-locked):\n# [bootstrap.packages]\n# "apt:tree" = "latest"\n')
+        stream.write(b'''# Optional image tools. Remove entries you do not need.
+# Run tools lock, then build --all. Existing profiles are never overwritten.
+[tools]
+kubectl = "1.36"
+aws-cli = "2"
+helm = "latest"
+terraform = "latest"
+# Required for locked Python tool environments.
+python = "3.14"
+"pipx:ansible-core" = "latest"
+
+# Optional Ubuntu packages (not artifact-locked):
+[bootstrap.packages]
+"apt:build-essential" = "latest"
+"apt:wget" = "latest"
+"apt:openssh-client" = "latest"
+"apt:rsync" = "latest"
+"apt:postgresql-client" = "latest"
+"apt:mysql-client" = "latest"
+"apt:redis-tools" = "latest"
+# "apt:tree" = "latest"
+''')
     return source

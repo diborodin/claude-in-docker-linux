@@ -77,7 +77,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_version_file_agrees_with_package(self):
         self.assertEqual((ROOT / "VERSION").read_text().strip(), __version__)
-        self.assertEqual(__version__, "0.4.0")
+        self.assertEqual(__version__, "0.4.5")
 
     def test_install_copies_runtime_bundle_with_verified_manifest_and_links(self):
         manifest = install_release(ROOT, self.layout, version=__version__)
