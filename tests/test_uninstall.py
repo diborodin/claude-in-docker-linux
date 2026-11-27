@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock, runtime_script_args
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from claude_docker import cli, installer
@@ -26,6 +28,7 @@ class UninstallTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.home = self.root / 'home'
         self.home.mkdir()
+        isolate_runtime_lock(self, self.root)
         runtime = self.root / 'runtime'
         runtime.mkdir(mode=0o700)
         self.env = {'HOME': str(self.home), 'XDG_CONFIG_HOME': str(self.root / 'config'),
@@ -548,7 +551,7 @@ class UninstallTests(unittest.TestCase):
         fakebin.mkdir()
         docker = self.write(fakebin / 'docker', '#!/bin/sh\nexit 0\n')
         docker.chmod(0o755)
-        result = subprocess.run([str(self.layout.command_link), 'uninstall'],
+        result = subprocess.run(runtime_script_args(self.root, self.layout.command_link, 'uninstall'),
                                 env=dict(self.env, PATH=str(fakebin) + ':' + os.defpath),
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)

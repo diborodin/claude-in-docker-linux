@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock, runtime_script_args
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from claude_docker import cli
 from claude_docker.compose import ComposeProject
@@ -86,6 +88,7 @@ class ComposeFixture:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        isolate_runtime_lock(self, self.root)
         self.home = self.root / 'host'
         self.workspace = self.root / 'work space "quote" : colon \\ backslash $TOKEN'
         self.workspace.mkdir()
@@ -112,6 +115,39 @@ class ComposeFixture:
 
 
 class ComposeTests(ComposeFixture, unittest.TestCase):
+    def test_cli_refuses_busy_start_before_hooks_and_releases_before_interactive_exec(self):
+        project = self.project()
+        original = self.runner.run
+        stderr = io.StringIO()
+
+        def run(argv, **kwargs):
+            if 'up' in argv:
+                with patch.object(cli, 'launch_environment',
+                                  side_effect=AssertionError('Busy CLI start ran its hooks')), \
+                        redirect_stderr(stderr):
+                    self.assertEqual(cli.main(['cli']), 1)
+                self.assertIn('retry', stderr.getvalue().lower())
+            return original(argv, **kwargs)
+
+        with patch.object(cli, 'resolve_host_paths', return_value=self.paths), \
+                patch.object(cli, 'load_config', return_value=self.config), \
+                patch.object(cli, 'CommandRunner', return_value=self.runner), \
+                patch.object(self.runner, 'run', side_effect=run):
+            project.up('claude-cli')
+
+        def exec_check(argv, **kwargs):
+            if argv[:2] == ['docker', 'exec'] and '-i' in argv:
+                project.down()
+            return original(argv, **kwargs)
+
+        with patch.object(cli, 'resolve_host_paths', return_value=self.paths), \
+                patch.object(cli, 'load_config', return_value=self.config), \
+                patch.object(cli, 'CommandRunner', return_value=self.runner), \
+                patch.object(cli, 'launch_environment', return_value=((), {})), \
+                patch.object(self.runner, 'run', side_effect=exec_check), redirect_stderr(stderr):
+            self.assertEqual(cli.main(['cli']), 0)
+        self.assertIsNone(project.state.read_mode())
+
     def test_inner_docker_readiness_is_independent_of_runtime_mounts_and_mode_records(self):
         runtime = DesktopRuntime(25, self.root / 'x11', self.root / 'Xauthority',
                                  ProcessIdentity(123, 456, '/usr/bin/Xephyr'))
@@ -245,7 +281,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         self.runner.run = run
         with patch.dict(os.environ, {'HOME': str(self.home)}, clear=True), \
                 patch('claude_docker.cli.CommandRunner', return_value=self.runner), redirect_stderr(io.StringIO()):
-            self.assertEqual(cli.main(['build', '--all']), 1)
+            self.assertEqual(cli.main(['build']), 1)
         self.assertEqual(len(contexts), 2)
         self.assertEqual(contexts[0], contexts[1])
         self.assertFalse(contexts[0].exists())
@@ -541,7 +577,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
                 workspace.touch()
             config_file.write_text('[container]\nmounts = [' + json.dumps(str(workspace)) + ']\n'
                                    '[state.code]\nsource = ' + json.dumps(str(invalid_state)) + '\n')
-            for operation in ('stop', 'build', 'rebuild', 'pull'):
+            for operation in ('stop', 'build', 'pull'):
                 with self.subTest(kind=kind, operation=operation):
                     self.runner.calls.clear()
                     env = {'HOME': str(self.home), 'CLAUDE_CONFIG_FILE': str(config_file),
@@ -551,14 +587,14 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
                     with patch.dict(os.environ, env, clear=True), \
                             patch('claude_docker.cli.CommandRunner', return_value=self.runner), \
                             redirect_stderr(stderr), redirect_stdout(io.StringIO()):
-                        rc = cli.main([operation])
+                        rc = cli.main([operation, *(['--only-cli'] if operation == 'build' else [])])
                     self.assertEqual(rc, 0, stderr.getvalue())
                     self.assertFalse(self.home.exists())
                     self.assertEqual(list(runtime_base.iterdir()), [])
                     self.assertTrue(invalid_state.is_file())
                     for argv, _ in self.runner.calls:
                         files = [Path(argv[i + 1]).name for i, arg in enumerate(argv) if arg == '-f']
-                        self.assertEqual(files, ['compose.yaml', 'build.json'] if operation in ('build', 'rebuild') else ['compose.yaml'])
+                        self.assertEqual(files, ['compose.yaml', 'build.json'] if operation == 'build' else ['compose.yaml'])
                         self.assertNotIn('--volumes', argv)
 
     def test_cli_build_rebuild_pull_and_stop_from_unrelated_directory(self):
@@ -577,12 +613,14 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
                'XDG_STATE_HOME': str(self.root / 'xdg-state'),
                'XDG_RUNTIME_DIR': str(self.root / 'run-base'), 'PYTHONDONTWRITEBYTECODE': '1'}
         Path(env['XDG_RUNTIME_DIR']).mkdir(mode=0o700)
-        for operation in ('build', 'rebuild', 'pull', 'stop'):
-            result = subprocess.run([sys.executable, str(ROOT / 'claude-docker'), operation],
+        for arguments in (('build', '--only-cli'), ('build', '--only-cli', '--rebuild'), ('pull',), ('stop',)):
+            operation = arguments[0]
+            result = subprocess.run(runtime_script_args(self.root, ROOT / 'claude-docker', *arguments),
                                     cwd=self.root, env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             if operation == 'pull':
                 self.assertIn('no external images', result.stdout.lower())
+        self.assertTrue((self.root / '.claude-docker-locks/runtime-transition.lock').is_file())
         commands = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(sum('build' in cmd for cmd in commands), 2)
         self.assertTrue(all(cmd[-1] == 'claude-cli' and '--profile' not in cmd
@@ -619,7 +657,7 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         runtime.mkdir(mode=0o700)
         env = {'PATH': str(binary), 'HOME': str(self.root), 'CLAUDE_CONFIG_FILE': str(config_file),
                'XDG_RUNTIME_DIR': str(runtime), 'DOCKER_HOST': 'ssh://caller', 'PYTHONDONTWRITEBYTECODE': '1'}
-        result = subprocess.run([sys.executable, '-B', str(ROOT / 'claude-docker'), 'claude', '--print'],
+        result = subprocess.run(runtime_script_args(self.root, ROOT / 'claude-docker', 'cli', '--print'),
                                 cwd=self.root, env=env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / 'new-workspace').is_dir())
@@ -638,51 +676,40 @@ class ComposeTests(ComposeFixture, unittest.TestCase):
         log = self.root / 'commands.jsonl'
         log.unlink()
         script.write_text('export TOKEN=never-forward; exit 9\n')
-        result = subprocess.run([sys.executable, '-B', str(ROOT / 'claude-docker'), 'claude'],
+        result = subprocess.run(runtime_script_args(self.root, ROOT / 'claude-docker', 'cli'),
                                 cwd=self.root, env=env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 1)
         self.assertIn('hooks.pre_launch', result.stderr)
         self.assertNotIn('never-forward', result.stderr)
         self.assertFalse(log.exists())
 
-    def test_cli_build_targets_require_explicit_desktop_or_all_selection(self):
+    def test_cli_build_defaults_to_both_images_and_can_select_one(self):
         config_dir = self.home / '.config/claude-docker'
         self.seed_code_version(config_dir)
         (config_dir / 'claude-desktop.version').write_text('5.11492.5\n')
-        for operation in ('build', 'rebuild'):
-            for options, expected in (([], ['claude-cli']),
-                                      (['--desktop'], ['claude-desktop']),
-                                      (['--all'], ['claude-cli', 'claude-desktop'])):
-                with self.subTest(operation=operation, options=options):
+        for rebuild in (False, True):
+            for options, expected in (([], ['claude-cli', 'claude-desktop']),
+                                      (['--only-desktop'], ['claude-desktop']),
+                                      (['--only-cli'], ['claude-cli'])):
+                with self.subTest(rebuild=rebuild, options=options):
                     self.runner.calls.clear()
                     with patch.dict(os.environ, {'HOME': str(self.home)}, clear=True), \
                             patch('claude_docker.cli.CommandRunner', return_value=self.runner):
-                        try:
-                            rc = cli.main([operation, *options])
-                        except SystemExit as error:
-                            self.fail(f'Build target options must be accepted: {error}')
+                        rc = cli.main(['build', *options, *(['--rebuild'] if rebuild else [])])
                     self.assertEqual(rc, 0)
                     commands = [argv for argv, _ in self.runner.calls]
                     self.assertEqual([argv[-1] for argv in commands], expected)
                     for argv in commands:
                         self.assertEqual('--profile' in argv, argv[-1] == 'claude-desktop')
-                        self.assertEqual('--pull' in argv, operation == 'rebuild')
-                        self.assertEqual('--no-cache' in argv, operation == 'rebuild')
+                        self.assertEqual('--pull' in argv, rebuild)
+                        self.assertEqual('--no-cache' in argv, rebuild)
                         self.assertNotIn('up', argv)
-
-    def test_cli_build_targets_are_mutually_exclusive(self):
-        with patch('claude_docker.cli.CommandRunner', return_value=self.runner), \
-                redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as caught:
-                cli.main(['build', '--desktop', '--all'])
-        self.assertEqual(caught.exception.code, 2)
-        self.assertEqual(self.runner.calls, [])
 
     def test_cli_invalid_workspace_fails_before_docker(self):
         config_file = self.root / 'invalid.toml'
         config_file.write_text('[container]\nmounts = ["/definitely-missing-workspace"]\n')
         env = {'PATH': '', 'HOME': str(self.root), 'CLAUDE_CONFIG_FILE': str(config_file)}
-        result = subprocess.run([sys.executable, str(ROOT / 'claude-docker'), 'claude'],
+        result = subprocess.run(runtime_script_args(self.root, ROOT / 'claude-docker', 'cli'),
                                 env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn('Workspace root', result.stderr)

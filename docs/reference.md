@@ -1,0 +1,495 @@
+# User reference
+
+Start with the [README](../README.md) for installation and common commands.
+This reference covers advanced settings, examples, and support limits.
+
+## What the program does
+
+- **host**: Your Linux computer and its Docker daemon.
+- **container**: An environment that Docker starts on the host.
+- **workspace**: A host directory that contains your working files.
+- **mount**: A connection that exposes a host path inside a container.
+- **inner Docker**: A separate Docker daemon inside a Sysbox container.
+
+## Requirements
+
+Ubuntu 26.04 CLI and Desktop image/tool checks passed on amd64. The Ubuntu 26.04.1 LTS
+Desktop image also passed the Chromium-policy GUI test on Docker 29.10.0.
+
+| Configuration | Intended reference | Actual qualification in this series |
+| --- | --- | --- |
+| CLI, no inner Docker, amd64 | Debian 13; Ubuntu 24.04 | Ubuntu 26.04 image and CLI image-runtime checks passed on the Debian 13 Docker host. Full interactive host-identity qualification remains open. |
+| CLI, no inner Docker, arm64 | Debian 13; Ubuntu 24.04 | arm64 build and runtime not executed. |
+| Desktop, amd64 | Linux graphical session with Xephyr | Historically, the Ubuntu 24.04 default-policy sandboxed Desktop FAILED on the Debian 13 Docker host: namespace EPERM, exit 133. Xauthority, nested clipboard, and cleanup checks passed. No unsafe fallback was used. |
+| Desktop with explicit chromium policy, amd64 | Docker Engine Community 29.10.0, Debian 13 amd64, no inner Docker | The Ubuntu 26.04.1 LTS image passed the [host-identity launcher/Xephyr test](desktop-security.md#qualification-evidence-and-limits). |
+| Desktop, arm64 | Linux graphical session with Xephyr | Not executed. |
+| Inner Docker with Sysbox | Ubuntu 24.04 | Live Sysbox and nested Docker not executed. Debian 13 is experimental. |
+| Shared system install | Linux with administrator installation | Temporary simulated layouts tested; real privileged and cross-account use not executed. |
+
+## Configure the program
+
+See [config.example.toml](../config.example.toml) for detailed configuration keys.
+Precedence is process environment overrides, then TOML settings, then detected
+host defaults. CLI identity overrides can change the container account,
+UID, GID, and home. The root account is not supported.
+
+Put `-d` or `--debug` before a command to print the selected config path
+to standard error. If the default file is absent, the diagnostic reports
+defaults and environment overrides. Config contents and credential values
+are not printed.
+
+Without a configuration file, the workspace default is `~/work/git`.
+The generated example shows several mount roots. To mount multiple
+workspaces, set this table in your configuration:
+
+```toml
+[container]
+mounts = ["~/work/git", "~/work/etc", "/srv/shared-projects"]
+```
+
+Paths must be absolute or start with `~/`. Each root must exist.
+An empty mount list disables workspace mounts.
+
+Default host storage uses these paths:
+
+| Purpose | Default path |
+| --- | --- |
+| Launcher configuration | `~/.config/claude-docker/config.toml` |
+| Program releases and installation records | `~/.local/share/claude-docker` |
+| Launcher state | `~/.local/state/claude-docker` |
+| Launcher cache | `~/.cache/claude-docker` |
+| Private runtime | `$XDG_RUNTIME_DIR/claude-docker`, if the runtime base is private and usable; otherwise `/tmp/claude-docker-<uid>` |
+| Claude Code state | `~/.claude` |
+| Claude Code JSON state | `~/.claude.json` |
+| Claude Desktop profile | `~/.config/Claude` |
+
+Absolute XDG base-directory variables replace their corresponding defaults.
+Claude state mounts are enabled by default. A missing Claude Code JSON file
+is not created. You can change a state source or disable its mount.
+If you disable a state mount, or if the host Claude Code JSON file does not exist,
+Claude writes the affected data as container-local state. This state is lost when
+the container is removed. A new container does not restore this state.
+
+`CLAUDE_CONFIG_FILE` selects another TOML file. An explicitly selected file
+must exist. `CLAUDE_MOUNTS_FILE` replaces the TOML workspace list with one
+host path per line; blank lines and lines that start with `#` are ignored.
+For advanced source layouts, `CLAUDE_DOCKER_DIR` selects an absolute program
+directory that contains the launcher package.
+
+First, export the AWS credential variables in your host shell.
+Then add their names to your configuration:
+
+```toml
+[environment]
+required = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+optional = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+```
+
+Keep credential values in the host process environment. Required variables
+must be present and nonempty. Optional variables are forwarded only when
+present. The launcher does not save their values in TOML or generated files.
+
+Each new CLI process receives the current selected host environment values.
+An existing CLI process keeps its old values. After you refresh credentials,
+start a new CLI process. For Desktop, restart its process:
+
+```bash
+claude-docker desktop --restart
+```
+
+Inner containers do not automatically inherit these variables. Pass each
+required variable explicitly when you start an inner container.
+
+### Prepare credentials and files before launch
+
+Set a trusted host Bash script in your configuration:
+
+```toml
+[hooks]
+pre_launch = "~/.config/claude-docker/pre-launch.sh"
+timeout_seconds = 60
+```
+
+Keep the AWS names in `[environment]` as shown above. Install the AWS CLI
+on the host and configure an identity that can request the federation token.
+Create `~/.config/claude-docker/pre-launch.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+credentials="$(
+  aws sts get-federation-token \
+    --name readonly \
+    --duration-seconds 43200 \
+    --policy-arns arn=arn:aws:iam::aws:policy/ReadOnlyAccess \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+    --output text
+)"
+read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+  <<< "$credentials"
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+unset credentials
+```
+
+The launcher sources the script in a separate Bash process, as your host user,
+from the directory where you called it. Shell startup files are not loaded.
+The script need not be executable. Omit `pre_launch` to disable the hook.
+The hook runs before each new CLI process and each Desktop start or restart.
+It does not run when Desktop is already running, or for build, check, and stop.
+Use `claude-docker desktop --restart` to refresh Desktop credentials.
+
+A script error or timeout stops the launch; an existing Desktop stays running.
+Only names in `[environment]` can receive hook exports or unsets. Host launcher
+and Docker transport settings retain their original values. The launcher does
+not save or print exported values. Script output is visible: do not print secrets
+or enable `set -x`. Run only scripts you trust.
+
+The script can also create or copy files before mounts are prepared. Put them
+inside configured workspace or state mounts so Claude can access them.
+
+## Use Claude Desktop
+
+The container UID must match the host UID. Close any host Claude app using
+the shared profile to avoid locks and concurrent writes.
+
+Resize the Xephyr window to resize Claude. Alt+Shift switches between US and
+Russian inside Xephyr. Set `keyboard_layout` and `keyboard_options` in `[desktop]`
+to use up to four comma-separated XKB layouts and comma-separated XKB options.
+An empty option string clears the options. `CLAUDE_DESKTOP_KEYBOARD_LAYOUT` and
+`CLAUDE_DESKTOP_KEYBOARD_OPTIONS` override TOML. Run `claude-docker desktop --restart`
+to apply changes to a running session.
+
+The default setting is `seccomp = "default"` in `[desktop]`. It preserves
+Docker policy. To request the Chromium policy, set this in TOML:
+
+```toml
+[desktop]
+seccomp = "chromium"
+```
+
+`CLAUDE_DESKTOP_SECCOMP` overrides TOML. Only `default` and `chromium` are
+accepted. Chromium requires Linux amd64 and builtin seccomp. In both
+`none` and `sysbox` modes, the launcher reads the outer daemon GitCommit.
+First launch uses HTTPS to match that commit to an official Moby release tag and resolve its profile.
+This traces source provenance and cannot detect unpublished vendor changes.
+A matching verified cache works offline. A Docker update selects a new
+cache entry automatically. Resolution errors stop launch with no automatic fallback.
+Four exact kernel namespace operations expand the kernel attack surface. Keep the internal sandbox enabled. Use `claude-docker desktop --restart`
+when the running profile differs. Restart clears stale Xephyr state and recreates only Desktop; it requires an unchanged Docker mode with no pending transition. Xephyr disables MIT-SHM to keep container IPC private. Live Sysbox remains unqualified.
+
+See the [Desktop security notes](desktop-security.md) for renderer results and why the GPU sandbox remains unqualified.
+
+The default clipboard mode is manual. To copy the host clipboard into
+Desktop, run:
+
+```bash
+claude-docker desktop-clipboard push
+```
+
+To copy the Desktop clipboard onto the host, run:
+
+```bash
+claude-docker desktop-clipboard pull
+```
+
+Review clipboard contents before a transfer; they can contain secrets.
+`--clipboard-sync` explicitly enables background bidirectional transfers.
+`--no-sandbox` explicitly disables the Chromium sandbox and is unsafe.
+Do not use it to turn the known sandbox failure into a qualification pass.
+The same risks apply to the corresponding configuration settings.
+
+Per-run sandbox and clipboard choices persist until restart or stop.
+Changing configuration alone does not reset a running Desktop process.
+To apply current configuration and refresh credentials, run:
+
+```bash
+claude-docker desktop --restart
+```
+
+## Use inner Docker
+
+On Desktop launch, restart, or reuse, the launcher creates or starts inner Docker
+as needed and waits up to 120 seconds for health before changing the Desktop
+session. Dependency repair keeps existing containers. If the image is missing, run `claude-docker pull` before retrying.
+
+The inner daemon uses mutual TLS and a managed data volume. To switch back
+to the default mode, stop the containers and set `docker_mode = "none"`.
+
+If you intend to permanently delete the managed inner Docker data, stop
+its containers first. Then request the volume inventory and confirmation:
+
+```bash
+claude-docker cleanup inner-docker
+```
+
+Use `--yes` for noninteractive deletion. Cleanup verifies volume names and ownership labels.
+
+## Update or uninstall
+
+Run `./install` from a newer trusted release to update the launcher.
+For changed sources with the same version, run `claude-docker uninstall`
+without `--purge`, then run `./install`. The installer verifies immutable
+bundles. Both workflows retain user configuration, state, and build inputs.
+
+### Update Claude Code or Desktop
+
+```bash
+# Update Code and Desktop, then build both images.
+claude-docker update
+# Update Code, then build only CLI.
+claude-docker update --only-cli
+# Update Desktop, then build only Desktop.
+claude-docker update --only-desktop
+# Update both, pull base images, and build without cache.
+claude-docker update --rebuild
+# Keep saved versions, pull base images, and build without cache.
+claude-docker build --rebuild
+```
+
+`build` and `update` select both images by default. Use `--only-cli` or
+`--only-desktop` to select one image. These flags cannot be combined.
+`build` uses saved versions. The first build saves the latest release for
+missing pins. `update` checks the latest release for each selected product,
+then builds the selected images. Code keeps a newer saved version.
+`update --only-desktop` keeps the saved Code version included in Desktop;
+if no Code pin exists, it selects the latest Code version once.
+
+Both pins live in `~/.config/claude-docker/` as `claude-code.version`
+and `claude-desktop.version`. `XDG_CONFIG_HOME` changes the base directory.
+Install, uninstall, and purge retain both pins. Ordinary builds with saved pins
+skip version lookups. These commands do not restart running containers.
+
+Both lookups show progress on stderr and keep the old pin on failure.
+Code reads official HTTPS release metadata using Python and requires HTTP 200.
+The lookup has a 30-second limit and needs no Docker or extra host tools.
+Desktop fetches fresh signed Anthropic apt metadata without Ubuntu package
+indexes. The selected Docker daemon caches a small Ubuntu helper for its native
+architecture. Preparing it can pull the Ubuntu and mise images. The daemon
+rebuilds it when its inputs change or it is removed. Desktop has a five-minute
+lookup limit plus ten seconds for cleanup. Its helper survives uninstall and
+purge. Image downloads have separate transfer limits.
+To retry with saved versions, use `build` with the same selection flags.
+
+An `update` can reuse system packages, tools, and customization layers.
+Add `--rebuild` to `build` or `update` for fresh base images and no cache.
+A raw Docker build uses the shipped `latest` policies when the artifact layers run. Code updates inside the containers are disabled.
+
+Run `claude-docker stop` before starting Code from the new image.
+Run `claude-docker desktop --restart` to use a rebuilt Desktop image with
+your existing profile.
+
+### Add image tools and packages
+
+Installed commands support optional user tools. Create a private example once:
+
+```bash
+claude-docker tools init
+```
+
+Edit `~/.config/claude-docker/mise.toml`. The example includes kubectl 1.36,
+AWS CLI v2, Helm, Terraform, and Ansible Core. Remove entries you do not need.
+Its optional apt packages are build-essential (includes make), wget,
+openssh-client, rsync, postgresql-client, mysql-client, and redis-tools.
+Mise Python 3.14 supports locked Ansible. uv stays in the baseline.
+Example profile:
+
+```toml
+[tools]
+kubectl = "1.36"
+aws-cli = "2"
+helm = "latest"
+terraform = "latest"
+python = "3.14"
+"pipx:ansible-core" = "latest"
+
+[bootstrap.packages]
+"apt:build-essential" = "latest"
+"apt:wget" = "latest"
+"apt:openssh-client" = "latest"
+"apt:rsync" = "latest"
+"apt:postgresql-client" = "latest"
+"apt:mysql-client" = "latest"
+"apt:redis-tools" = "latest"
+# "apt:tree" = "latest"
+```
+
+The lock selects an exact patch version for each version request.
+
+Lock artifacts, build both images, remove old containers, then launch:
+
+```bash
+claude-docker tools lock
+claude-docker build
+claude-docker stop
+claude-docker cli
+```
+
+Use `build --only-cli` for CLI or `build --only-desktop` for Desktop.
+Tools are installed in system paths outside mounted HOME. Manual installations are lost when containers
+are removed. Both images include these default tools:
+
+| Installer | Tools |
+| --- | --- |
+| apt | ripgrep, jq, shellcheck, shfmt, sd, miller, hyperfine, bats, less, bsdextrautils |
+| mise | fd, bat, ast-grep, yq (Mike Farah), gh, uv, difftastic, scc, duckdb |
+
+Miller provides `mlr`. Difftastic provides `difft`. Kubectl remains optional.
+
+The sibling `mise.lock` pins artifacts and checksums for `linux-x64` and
+`linux-arm64`. Python tools use `pipx:` and retain their dependency graphs
+under `.mise/locks/claude-docker/` beside the profile. Keep this directory with
+the profile and its sibling lock; builds verify its digests. The first Python lock
+prepares a cached helper with Python and uv. The host needs neither tool.
+Ordinary locking preserves matching resolutions. Use
+`claude-docker tools lock --bump` to advance requests. Builds require a matching
+lock and never create or refresh one. Comments and apt edits keep tool locks
+valid. An apt-only profile needs no artifact lock; apt packages are not pinned
+by this lock. The shipped base and user artifact locks are separate.
+
+`XDG_CONFIG_HOME` changes the default directory. `CLAUDE_MISE_CONFIG_FILE`
+selects an absolute or `~/` file, independently of `CLAUDE_CONFIG_FILE`.
+For example, `~/tools/custom.toml` uses the sibling `~/tools/custom.lock`.
+A missing default profile adds no tools. An explicitly selected missing file
+is an error. Init never overwrites a file. The profile, lock,
+and Python lock directories survive updates, uninstall, and purge, including custom locations.
+
+Only `[tools]` and apt-only `[bootstrap.packages]` are supported. Use a single
+version string or a version/options table with scalar backend options.
+Requests must be additive. Baseline removal, other sections, unsupported
+managers, templates, core controls, and non-Python dependency sidecars are rejected.
+Checksum and locked-install policy stay program-controlled. Docker receives
+private snapshots of exact build inputs, without sending your HOME,
+configuration directory, or workspace.
+
+Manually migrate old edits from `image/mise.toml` into your user profile, then
+lock and rebuild. Updates do not copy those edits or overwrite user profiles.
+Contributors can edit the baseline hook `image/customize.sh` and run
+`./claude-docker tools lock --base` in a trusted source or development checkout.
+Use `./install --dev` to link a development checkout.
+
+### Activate mise in Claude Code
+
+Merge this entry into `~/.claude/settings.json`. Keep existing settings and hooks.
+The default Claude state mount makes this host file available in the container.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$CLAUDE_ENV_FILE\" ] && echo 'eval \"$(mise hook-env -s bash)\"' >> \"$CLAUDE_ENV_FILE\"; true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If Claude Code runs commands in zsh, replace `-s bash` with `-s zsh`.
+Start a new Claude Code session after the change. Mise runs inside the container;
+it is not required on the host. See the [mise integration instructions](https://mise.jdx.dev/agents.html#claude-code).
+
+### Tell Claude Code which tools to use
+
+You can append this section to the local `~/.claude/CLAUDE.md` file.
+Keep your existing instructions. The default Claude state mount exposes this
+file inside the container.
+
+```markdown
+## System tools
+
+- Search: use `rg` for content and `fd` for file names. Limit output with
+  `rg -l`, `rg -m 5`, and `--max-columns 200`.
+- Replace text: use `sd` for simple replacements and `ast-grep` for structural
+  code changes. Do not use `sed -i`.
+- JSON: use `jq`. YAML, TOML, and XML: use `yq` (the Mike Farah Go version,
+  not the Python wrapper).
+- Tables and logs: use `mlr` for simple transformations. Use
+  `duckdb -c "SELECT ... FROM 'file.csv'"` for aggregation and Parquet.
+- Python: use `uv` instead of pip and venv. GitHub: use `gh`.
+- Repository overview: use `scc`. Code diffs: use `difft`.
+- Bash scripts: run `shellcheck` before you finish. For scripts that must work
+  with POSIX sh, check portability with `dash script.sh`. Write tests with
+  `bats`. To debug, use `PS4='+ ${BASH_SOURCE}:${LINENO}: ' bash -x script.sh`.
+```
+
+### Run a personal build script
+
+Create a private example for `checkbashisms` and Google Cloud CLI:
+
+```bash
+claude-docker customize init
+```
+
+Edit `~/.config/claude-docker/customize.sh`. `XDG_CONFIG_HOME` changes the
+default directory. The script runs as root after tool setup in each image
+build, before the Claude artifacts are installed. The example installs to
+`/usr/local/bin`, outside mounted HOME. Google Cloud CLI uses the official
+`packages.cloud.google.com` apt repository with a scoped signing key.
+Remove example sections you do not need. Init does not change existing scripts.
+Run `claude-docker build`, run `claude-docker stop`, then start Claude.
+Artifact locks apply to the mise profile. Keep secrets out of your script.
+Docker receives its contents. Environment forwarding applies when Claude starts.
+To disable the script, rename it and build again. Updates, uninstall, and
+purge retain the script.
+
+For implementation details, see [architecture](architecture.md) and
+[Desktop security](desktop-security.md).
+
+### Uninstall
+
+For normal removal, run:
+
+```bash
+claude-docker uninstall
+```
+
+Normal uninstall removes owned program files and managed containers.
+It retains launcher configuration, user data, images, networks, and volumes.
+
+To also purge eligible launcher configuration and managed Docker storage,
+request an inventory and give interactive consent:
+
+```bash
+claude-docker uninstall --purge
+```
+
+For noninteractive purge, explicitly confirm with `--yes`:
+
+```bash
+claude-docker uninstall --purge --yes
+```
+
+Purge checks exact ownership labels: the prefix is
+`io.github.diborodin.claude-in-docker-linux.`, with `managed=true` and
+`owner-uid` equal to your host UID. It does not run a global Docker prune.
+All removal modes retain `~/.claude`, `~/.claude.json`, `~/.config/Claude`,
+custom state sources, and workspaces. Protected paths take priority over
+program ownership, even during purge.
+
+For a shared installation, an administrator installs with
+`sudo ./install --system`. Each user still has separate launcher configuration
+and state. To remove the shared program, use trusted matching source:
+
+```bash
+sudo ./install --uninstall --system
+```
+
+If removal is interrupted, the installed command can already be absent.
+From trusted matching source, use the same HOME and XDG environment as the
+original user installation and resume removal:
+
+```bash
+./install --uninstall
+```
+
+A pending purge retains its original purge choice and protected inventory.
+If Docker cleanup remains pending, retry requires the usual consent.
+Do not edit or delete private removal records. Finish removal before you
+reinstall. If another install or uninstall is busy, wait for it to finish
+before you retry.

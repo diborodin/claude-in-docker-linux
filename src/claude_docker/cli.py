@@ -17,7 +17,32 @@ from .desktop import launch_desktop, stop_desktop_runtime
 from .hooks import launch_environment
 from .image_tools import image_build_inputs
 from .mounts import container_workdir, prepare_mounts
-from .paths import resolve_host_paths, resolve_program_dir
+from .paths import HostPaths, resolve_host_paths, resolve_program_dir
+from .state import runtime_transition
+
+
+_COMMAND_GROUPS = (
+    ('cli', 'desktop', 'desktop-clipboard'),
+    ('config', 'check', 'tools', 'customize'),
+    ('build', 'pull', 'stop', 'update'),
+    ('cleanup', 'uninstall'),
+)
+
+
+class _RootHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def add_arguments(self, actions):
+        for action in actions:
+            if action.dest != 'command':
+                self.add_argument(action)
+                continue
+            rows = []
+            for group in _COMMAND_GROUPS:
+                if rows:
+                    rows.append('--')
+                for name in group:
+                    summary = action.choices[name].description.splitlines()[0]
+                    rows.append(f'{name:<19} {summary}')
+            self.add_text('\n'.join(rows))
 
 
 def _report_config_source(path: Path, found: bool) -> None:
@@ -69,6 +94,38 @@ def _report_paths(*, include_version: bool) -> None:
         print('claude-docker: configuration paths unavailable', file=sys.stderr)
 
 
+@runtime_transition()
+def _stop(paths: HostPaths, uid: int) -> None:
+    failures = []
+    project = None
+    runner = CommandRunner()
+    try:
+        account = pwd.getpwuid(uid)
+        config = load_config(env=os.environ, paths=paths,
+                             account=AccountInfo(account.pw_name, uid, os.getgid(), Path(account.pw_dir)),
+                             report_source=None)
+        project = ComposeProject(config, paths, (), runner)
+    except (ValueError, OSError, KeyError):
+        failures.append('Configuration or Compose project setup failed')
+        try:
+            project = ComposeProject.for_teardown(paths, runner)
+        except (ValueError, OSError, KeyError):
+            failures.append('Docker Compose teardown setup failed')
+    # Recorded host cleanup must run independently of configuration and
+    # project construction; its component cleanup also continues on error.
+    try:
+        stop_desktop_runtime(paths, project=project)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        failures.append('Desktop runtime cleanup failed')
+    if project is not None:
+        try:
+            project._teardown('down')
+        except (ValueError, OSError, subprocess.SubprocessError):
+            failures.append('Docker Compose teardown failed')
+    if failures:
+        raise ValueError('; '.join(failures))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments == ['_clipboard-worker']:
@@ -76,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return worker_main()
     parser = argparse.ArgumentParser(
         prog="claude-docker", description="Run Claude Code and Desktop in Docker on Linux.",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        formatter_class=_RootHelpFormatter)
     parser.add_argument("-d", "--debug", action="store_true",
                         help="Show configuration/build paths, also with --help or --version (before COMMAND).")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -91,6 +148,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         command_parsers.append(child)
         return child
 
+    command(commands, 'cli', 'Run Claude Code with literal trailing application arguments.',
+            details='All trailing arguments, including --help, go to Claude Code unchanged.',
+            examples=('claude-docker cli', 'claude-docker cli --resume'),
+            add_help=False, usage='%(prog)s [CLAUDE_ARGS ...]')
+    desktop = command(commands, 'desktop', 'Launch Claude Desktop in a private nested display.',
+                      details='Put launcher options before application arguments. Use -- to separate them.\n'
+                              'The default policy enables the sandbox and uses manual clipboard transfers.\n'
+                              'A running process keeps its settings and credentials until restart or stop.\n'
+                              'Sysbox mode starts inner Docker as needed and waits for it before launch or reuse.\n'
+                              'Select seccomp in configuration with [desktop].seccomp or CLAUDE_DESKTOP_SECCOMP.',
+                      examples=('claude-docker desktop', 'claude-docker desktop --restart',
+                                'claude-docker desktop -- --help'),
+                      usage='%(prog)s [--restart] [--clipboard-sync] [--no-sandbox] [-- APP_ARGS ...]')
+    desktop.add_argument('--restart', action='store_true', help='Recreate only Desktop to apply current settings and refresh credentials.')
+    desktop.add_argument('--clipboard-sync', action='store_true', help='Opt into bidirectional host/Desktop clipboard transfers (may transfer secrets).')
+    desktop.add_argument('--no-sandbox', action='store_true', help='Disable the Chromium sandbox (unsafe; incompatible with chromium seccomp).')
+    clipboard = command(commands, 'desktop-clipboard', 'Explicitly transfer the host/Desktop clipboard.',
+                        details='Requires a live recorded Desktop session, host DISPLAY, and xclip.',
+                        examples=('claude-docker desktop-clipboard push', 'claude-docker desktop-clipboard pull'))
+    clipboard_commands = clipboard.add_subparsers(dest='clipboard_command', required=True)
+    command(clipboard_commands, 'push', 'Copy host clipboard into Desktop (may include secrets).',
+            examples=('claude-docker desktop-clipboard push',))
+    command(clipboard_commands, 'pull', 'Copy Desktop clipboard onto the host.',
+            details='Replaces the host clipboard with the Desktop clipboard contents.',
+            examples=('claude-docker desktop-clipboard pull',))
     config = command(commands, 'config', 'Manage launcher configuration.',
                      examples=('claude-docker config init', 'claude-docker config init --help'))
     config_commands = config.add_subparsers(dest='config_command', required=True)
@@ -137,6 +219,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                     'The script runs as root during either image build. Move it aside to disable it.\n'
                     'It survives updates, uninstall, and purge.',
             examples=('claude-docker customize init',))
+    for name, summary, details, examples in (
+        ('build', 'Build both Claude images using saved versions and the build cache.',
+         'Default: CLI and Desktop images. --only-cli or --only-desktop selects one image.\n'
+         'First builds save the latest versions. Later builds use the saved versions.\n'
+         'Runs your optional customize.sh as root before installing Desktop and copying Claude Code.\n'
+         'Use --rebuild for fresh base images and no cache.\n'
+         'Stop existing containers after building to use the new image.',
+         ('claude-docker build', 'claude-docker build --only-desktop',
+          'claude-docker build --rebuild')),
+        ('pull', 'Pull external images used by the selected Docker mode.',
+         'Used for optional inner Docker in Sysbox mode. Does not build Claude images.\n'
+         'In docker_mode=none there are no external images to pull.',
+         ('claude-docker pull',)),
+        ('stop', 'Stop and remove Claude containers and recorded Desktop display services.',
+         'Retains host-mounted Claude state, workspaces, and named inner Docker data volumes.',
+         ('claude-docker stop',)),
+        ('update', 'Update Claude versions and build both images using the build cache.',
+         'Default: update Claude Code and the signed Desktop package version, then build both images.\n'
+         '--only-cli updates Claude Code and builds only CLI.\n'
+         '--only-desktop updates Desktop and builds only Desktop; keeps the saved Claude Code version.\n'
+         'Runs your optional customize.sh as root before installing Desktop and copying Claude Code.\n'
+         'Use --rebuild for fresh base images and no cache.\n'
+         'Stop existing containers after building to use the new image.',
+         ('claude-docker update', 'claude-docker update --only-cli',
+          'claude-docker update --only-desktop --rebuild')),
+    ):
+        child = command(commands, name, summary, details=details, examples=examples)
+        if name in ('build', 'update'):
+            targets = child.add_mutually_exclusive_group()
+            targets.add_argument('--only-desktop', action='store_true', help='Select only the Desktop image.')
+            targets.add_argument('--only-cli', action='store_true', help='Select only the CLI image.')
+            child.add_argument('--rebuild', action='store_true',
+                               help='Pull fresh base images and build without cache.')
     cleanup = command(commands, 'cleanup', 'Explicitly delete named application resources.',
                       examples=('claude-docker cleanup inner-docker --help',))
     cleanup_commands = cleanup.add_subparsers(dest='cleanup_command', required=True)
@@ -146,60 +261,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     examples=('claude-docker stop', 'claude-docker cleanup inner-docker',
                               'claude-docker cleanup inner-docker --yes'))
     inner.add_argument('--yes', action='store_true', help='Confirm permanent deletion without an interactive prompt.')
-    for name, summary, details, examples in (
-        ('build', 'Build selected images using the build cache.',
-         'Default: CLI image only. --desktop or --update-desktop selects Desktop unless --all is set.\n'
-         'First builds save the latest versions for the selected images. Later builds use the saved versions.\n'
-         'Runs your optional customize.sh as root before installing Desktop and copying Claude Code.\n'
-         'Stop existing containers after building to use the new image.',
-         ('claude-docker build', 'claude-docker build --update-desktop',
-          'claude-docker build --all --update-claude --update-desktop')),
-        ('rebuild', 'Build selected images with fresh base images and no cache.',
-         'Default: CLI image only. --desktop or --update-desktop selects Desktop unless --all is set.\n'
-         'First builds save the latest versions for the selected images. Later builds use the saved versions.\n'
-         'Runs your optional customize.sh as root before installing Desktop and copying Claude Code.\n'
-         'Stop existing containers after rebuilding to use the new image.',
-         ('claude-docker rebuild', 'claude-docker rebuild --update-desktop',
-          'claude-docker rebuild --all --update-claude --update-desktop')),
-        ('pull', 'Pull external images used by the selected Docker mode.',
-         'Used for optional inner Docker in Sysbox mode. Does not build Claude images.\n'
-         'In docker_mode=none there are no external images to pull.',
-         ('claude-docker pull',)),
-        ('stop', 'Stop and remove Claude containers and recorded Desktop display services.',
-         'Retains host-mounted Claude state, workspaces, and named inner Docker data volumes.',
-         ('claude-docker stop',)),
-    ):
-        child = command(commands, name, summary, details=details, examples=examples)
-        if name in ('build', 'rebuild'):
-            targets = child.add_mutually_exclusive_group()
-            targets.add_argument('--desktop', action='store_true', help='Build only the Desktop image.')
-            targets.add_argument('--all', action='store_true', help='Build both CLI and Desktop images.')
-            child.add_argument('--update-claude', action='store_true',
-                               help='Check the latest Claude Code release and save the selected version before building.')
-            child.add_argument('--update-desktop', action='store_true',
-                               help='Save the latest signed Desktop package version and build Desktop. '
-                                    'Combine with --all to build both images.')
-    desktop = command(commands, 'desktop', 'Launch Claude Desktop in a private nested display.',
-                      details='Put launcher options before application arguments. Use -- to separate them.\n'
-                              'The default policy enables the sandbox and uses manual clipboard transfers.\n'
-                              'A running process keeps its settings and credentials until restart or stop.\n'
-                              'Sysbox mode starts inner Docker as needed and waits for it before launch or reuse.\n'
-                              'Select seccomp in configuration with [desktop].seccomp or CLAUDE_DESKTOP_SECCOMP.',
-                      examples=('claude-docker desktop', 'claude-docker desktop --restart',
-                                'claude-docker desktop -- --help'),
-                      usage='%(prog)s [--restart] [--clipboard-sync] [--no-sandbox] [-- APP_ARGS ...]')
-    desktop.add_argument('--restart', action='store_true', help='Recreate only Desktop to apply current settings and refresh credentials.')
-    desktop.add_argument('--clipboard-sync', action='store_true', help='Opt into bidirectional host/Desktop clipboard transfers (may transfer secrets).')
-    desktop.add_argument('--no-sandbox', action='store_true', help='Disable the Chromium sandbox (unsafe; incompatible with chromium seccomp).')
-    clipboard = command(commands, 'clipboard', 'Explicitly transfer the host/Desktop clipboard.',
-                        details='Requires a live recorded Desktop session, host DISPLAY, and xclip.',
-                        examples=('claude-docker clipboard push', 'claude-docker clipboard pull'))
-    clipboard_commands = clipboard.add_subparsers(dest='clipboard_command', required=True)
-    command(clipboard_commands, 'push', 'Copy host clipboard into Desktop (may include secrets).',
-            examples=('claude-docker clipboard push',))
-    command(clipboard_commands, 'pull', 'Copy Desktop clipboard onto the host.',
-            details='Replaces the host clipboard with the Desktop clipboard contents.',
-            examples=('claude-docker clipboard pull',))
     uninstall = command(commands, 'uninstall', 'Remove this installation while retaining user data and Docker storage.',
                         details='Normal removal retains launcher configuration, images, networks, and volumes.\n'
                                 '--purge also removes eligible launcher configuration and managed Docker storage.\n'
@@ -208,24 +269,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                                   'claude-docker uninstall --purge --yes'))
     uninstall.add_argument('--purge', action='store_true', help='Also remove exact managed Docker resources and launcher configuration.')
     uninstall.add_argument('--yes', action='store_true', help='Confirm purge without an interactive prompt.')
-    command(commands, 'claude', 'Run Claude Code with literal trailing application arguments.',
-            details='All trailing arguments, including --help, go to Claude Code unchanged.',
-            examples=('claude-docker claude', 'claude-docker claude --resume'),
-            add_help=False, usage='%(prog)s [CLAUDE_ARGS ...]')
     # Generate the overview from the actual parsers so flags cannot drift from usage.
-    overview = '\n'.join(
-        '\n'.join('  ' + line for line in child.format_usage().removeprefix('usage: ').rstrip().splitlines())
-        for child in command_parsers)
+    overview_lines = []
+    group_starts = {f'claude-docker {group[0]}' for group in _COMMAND_GROUPS[1:]}
+    for child in command_parsers:
+        if child.prog in group_starts:
+            overview_lines.append('  --')
+        overview_lines.extend('  ' + line for line in
+                              child.format_usage().removeprefix('usage: ').rstrip().splitlines())
+    overview = '\n'.join(overview_lines)
     parser.epilog = (
         'Command usage (command options go after COMMAND; global -d goes before COMMAND):\n' + overview + '\n\n'
         'For option descriptions, run: claude-docker COMMAND --help\n'
         'For example: claude-docker check --help\n\n'
         'Examples:\n'
         '  claude-docker config init\n'
-        '  claude-docker build --all\n'
+        '  claude-docker build\n'
         '  claude-docker check --desktop --clipboard\n'
         '  claude-docker desktop --restart\n\n'
-        'All arguments after claude go to Claude Code; claude --help runs application help.\n'
+        'All arguments after cli go to Claude Code; cli --help runs application help.\n'
         'Use desktop -- --help for Desktop application help.')
     # Only leading global flags belong to the launcher. Preserve application tails.
     prefix = []
@@ -233,7 +295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prefix.append(arguments.pop(0))
     if prefix:
         _report_paths(include_version=True)
-    claude_args = arguments[1:] if arguments[:1] == ['claude'] else []
+    claude_args = arguments[1:] if arguments[:1] == ['cli'] else []
     desktop_args = []
     if arguments[:1] == ['desktop']:
         boundary = 1
@@ -246,12 +308,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             desktop_args = desktop_args[1:]
         args = parser.parse_args(prefix + arguments[:boundary])
     else:
-        args = parser.parse_args(prefix + (arguments[:1] if arguments[:1] == ['claude'] else arguments))
+        args = parser.parse_args(prefix + (arguments[:1] if arguments[:1] == ['cli'] else arguments))
     if args.command is None:
         parser.print_help()
     if not prefix and args.debug:
         _report_paths(include_version=args.debug)
-    elif not args.debug and args.command in ('build', 'rebuild', 'claude', 'desktop'):
+    elif not args.debug and args.command in ('build', 'update', 'cli', 'desktop'):
         print(f'claude-docker: launcher version: {__version__}', file=sys.stderr)
     if args.command is None:
         return 0
@@ -296,7 +358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stderr.write(f'claude-docker: {error}\n')
             return 1
         print(f'Created customization script: {destination}')
-    elif args.command == 'clipboard':
+    elif args.command == 'desktop-clipboard':
         from .clipboard import clipboard_push, clipboard_pull
         from .desktop import XephyrManager
         try:
@@ -340,41 +402,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             uid = os.getuid()
             paths = resolve_host_paths(os.environ, uid, create_runtime=False)
-            failures = []
-            project = None
-            runner = CommandRunner()
-            try:
-                account = pwd.getpwuid(uid)
-                config = load_config(env=os.environ, paths=paths,
-                                     account=AccountInfo(account.pw_name, uid, os.getgid(), Path(account.pw_dir)),
-                                     report_source=None)
-                project = ComposeProject(config, paths, (), runner)
-            except (ValueError, OSError, KeyError):
-                failures.append('Configuration or Compose project setup failed')
-                try:
-                    project = ComposeProject.for_teardown(paths, runner)
-                except (ValueError, OSError, KeyError):
-                    failures.append('Docker Compose teardown setup failed')
-            # Recorded host cleanup must run independently of configuration and
-            # project construction; its component cleanup also continues on error.
-            try:
-                stop_desktop_runtime(paths, project=project)
-            except (ValueError, OSError, subprocess.SubprocessError):
-                failures.append('Desktop runtime cleanup failed')
-            if project is not None:
-                try:
-                    project.down()
-                except (ValueError, OSError, subprocess.SubprocessError):
-                    failures.append('Docker Compose teardown failed')
-            if failures:
-                raise ValueError('; '.join(failures))
+            _stop(paths, uid)
         except (ValueError, OSError) as error:
             sys.stderr.write(f"claude-docker: {error}\n")
             return 1
-    elif args.command in ('build', 'rebuild', 'pull', 'claude', 'desktop'):
+    elif args.command in ('build', 'update', 'pull', 'cli', 'desktop'):
         try:
             uid = os.getuid()
-            paths = resolve_host_paths(os.environ, uid, create_runtime=args.command == 'claude')
+            paths = resolve_host_paths(os.environ, uid, create_runtime=False)
             account = pwd.getpwuid(uid)
             config = load_config(env=os.environ, paths=paths,
                                  account=AccountInfo(account.pw_name, uid, os.getgid(),
@@ -383,25 +418,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == 'desktop':
                 return launch_desktop(config, restart=args.restart, clipboard_sync=args.clipboard_sync,
                                       no_sandbox=args.no_sandbox, app_args=desktop_args)
-            if args.command == 'claude':
-                env_names, app_env = launch_environment(config.hooks, config.environment, os.environ)
-                mounts = prepare_mounts(config)
-                project = ComposeProject(config, paths, mounts, CommandRunner())
-                workdir = container_workdir(Path.cwd(), mounts, config.container.home)
-                project.up('claude-cli')
-                container = project.container_id('claude-cli')
-                project.report_versions(container)
+            if args.command == 'cli':
+                with runtime_transition():
+                    env_names, app_env = launch_environment(config.hooks, config.environment, os.environ)
+                    mounts = prepare_mounts(config)
+                    project = ComposeProject(config, paths, mounts, CommandRunner())
+                    workdir = container_workdir(Path.cwd(), mounts, config.container.home)
+                    project._up('claude-cli')
+                    container = project.container_id('claude-cli')
+                    project.report_versions(container)
                 return project.exec('claude-cli', ['claude', *claude_args], workdir=workdir,
                                     env_names=env_names, env=app_env, interactive=True,
                                     tty=sys.stdin.isatty() and sys.stdout.isatty(), container=container)
             project = ComposeProject(config, paths, (), CommandRunner())
-            if args.command in ('build', 'rebuild'):
-                rebuild = args.command == 'rebuild'
-                services = (('claude-cli', 'claude-desktop') if args.all else
-                            ('claude-desktop',) if args.desktop or args.update_desktop else ('claude-cli',))
+            if args.command in ('build', 'update'):
+                rebuild = args.rebuild
+                services = (('claude-desktop',) if args.only_desktop else
+                            ('claude-cli',) if args.only_cli else ('claude-cli', 'claude-desktop'))
                 with image_build_inputs(project.program_dir, paths, os.environ, runner=project.runner,
                                         include_desktop='claude-desktop' in services,
-                                        update_claude=args.update_claude, update_desktop=args.update_desktop,
+                                        update_claude=args.command == 'update' and not args.only_desktop,
+                                        update_desktop=args.command == 'update' and not args.only_cli,
                                         report_paths=args.debug) as context:
                     for service in services:
                         project.build(service, pull=rebuild, no_cache=rebuild, build_context=context)

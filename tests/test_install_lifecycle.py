@@ -10,6 +10,8 @@ import tempfile
 import textwrap
 import unittest
 
+from tests import runtime_script_args
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,7 +68,10 @@ class InstallLifecycleTests(unittest.TestCase):
         self.docker_log = self.root / 'docker.jsonl'
 
     def run_command(self, *arguments, expected_stderr=''):
-        result = subprocess.run([str(arg) for arg in arguments], cwd=self.root,
+        command = [str(arg) for arg in arguments]
+        if command[1:2] in (['uninstall'], ['--uninstall']):
+            command = runtime_script_args(self.root, *arguments)
+        result = subprocess.run(command, cwd=self.root,
                                 env=self.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0,
                          f'{arguments!r}\nstdout: {result.stdout}\nstderr: {result.stderr}')
@@ -247,7 +252,7 @@ class InstallLifecycleTests(unittest.TestCase):
                                         'Fetching signed index (fixture)\n'
                                         'claude-docker: Claude Desktop version: 5.11492.5\n'
                                         f'claude-docker: tools: {profile}')
-        self.run_command(self.command, '-d', 'build', '--all', expected_stderr=diagnostic)
+        self.run_command(self.command, '-d', 'build', expected_stderr=diagnostic)
         self.assertEqual((profile.parent / 'claude-desktop.version').read_text(), '5.11492.5\n')
         builds = [json.loads(line) for line in self.docker_log.read_text().splitlines()]
         self.assertEqual([build['service'] for build in builds], ['claude-cli', 'claude-desktop'])
@@ -318,7 +323,7 @@ with patch('os.getuid', return_value=int(uid)), patch('pwd.getpwuid', return_val
                           '(not found; using defaults and environment overrides)\n'
                           'claude-docker: Claude Code version: 2.1.326\n'
                           f'claude-docker: tools: {selected}\n')
-            self.run_command(sys.executable, '-c', harness, release, uid, home, '-d', 'build',
+            self.run_command(sys.executable, '-c', harness, release, uid, home, '-d', 'build', '--only-cli',
                              expected_stderr=diagnostic)
             expected.append((str(uid), profile))
         self.env = original_env

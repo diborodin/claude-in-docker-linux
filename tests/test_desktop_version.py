@@ -86,24 +86,24 @@ class DesktopVersionTests(unittest.TestCase):
         return result
 
     def test_first_desktop_build_persists_exact_version_and_reuses_pin_without_lookup(self):
-        self.assertEqual(self.build(['build', '--desktop'], '1:5.10.0~rc2-1ubuntu2\n'), 0,
+        self.assertEqual(self.build(['build', '--only-desktop'], '1:5.10.0~rc2-1ubuntu2\n'), 0,
                          self.errors.getvalue())
         self.assertTrue(self.pin.is_file(), 'First Desktop build did not persist a version')
         self.assertEqual(self.pin.read_bytes(), b'1:5.10.0~rc2-1ubuntu2\n')
         self.assertEqual(stat.S_IMODE(self.pin.stat().st_mode), 0o600)
-        self.assertEqual(self.build(['build', '--desktop']), 0, self.errors.getvalue())
+        self.assertEqual(self.build(['build', '--only-desktop']), 0, self.errors.getvalue())
         self.assertEqual([entry[2] for entry in self.builds], [b'1:5.10.0~rc2-1ubuntu2\n'] * 2)
         self.assertEqual(self.resolutions, 1)
 
     def test_resolution_uses_the_selected_remote_arm64_daemon(self):
         self.env['DOCKER_DEFAULT_PLATFORM'] = 'linux/amd64'
-        self.assertEqual(self.build(['build', '--desktop'], '5.11-1\n',
+        self.assertEqual(self.build(['build', '--only-desktop'], '5.11-1\n',
                                     server_platform='linux/arm64'), 0, self.errors.getvalue())
         self.assertEqual(self.pin.read_bytes(), b'5.11-1\n')
 
     def test_unsupported_daemon_platform_fails_without_resolving_or_publishing(self):
         self.pin.write_bytes(b'5.10-1\n')
-        self.assertEqual(self.build(['build', '--update-desktop'], '5.11-1\n', server_platform='linux/ppc64le'), 1)
+        self.assertEqual(self.build(['update', '--only-desktop'], '5.11-1\n', server_platform='linux/ppc64le'), 1)
         self.assertIn('Unsupported Claude Desktop platform', self.errors.getvalue())
         self.assertEqual(self.pin.read_bytes(), b'5.10-1\n')
         self.assertEqual(self.resolutions, 0)
@@ -111,7 +111,7 @@ class DesktopVersionTests(unittest.TestCase):
 
     def test_cli_build_ignores_even_an_invalid_desktop_pin_and_omits_desktop_inputs(self):
         self.pin.write_bytes(b'junk')
-        self.assertEqual(self.build(['build', '--update-claude'], code='2.3.0'), 0,
+        self.assertEqual(self.build(['update', '--only-cli'], code='2.3.0'), 0,
                          self.errors.getvalue())
         self.assertEqual(self.builds[0][0], 'claude-cli')
         self.assertIsNone(self.builds[0][2])
@@ -120,7 +120,7 @@ class DesktopVersionTests(unittest.TestCase):
 
     def test_desktop_update_alone_selects_desktop_and_keeps_code_pin(self):
         self.pin.write_bytes(b'5.10-1\n')
-        self.assertEqual(self.build(['rebuild', '--update-desktop'], '5.10-2\n'), 0,
+        self.assertEqual(self.build(['update', '--only-desktop', '--rebuild'], '5.10-2\n'), 0,
                          self.errors.getvalue())
         self.assertEqual(self.builds[0][0], 'claude-desktop')
         self.assertEqual(self.builds[0][2:4], (b'5.10-2\n', b'2.2.0\n'))
@@ -130,7 +130,7 @@ class DesktopVersionTests(unittest.TestCase):
 
     def test_all_with_both_updates_uses_one_snapshot_even_if_pin_changes_after_cli(self):
         self.pin.write_bytes(b'1:5.10-1\n')
-        self.assertEqual(self.build(['build', '--all', '--update-claude', '--update-desktop'],
+        self.assertEqual(self.build(['update'],
                                     '2:5.10-1\n', code='2.3.0', change_pin_after_cli=True), 0,
                          self.errors.getvalue())
         self.assertEqual([entry[0] for entry in self.builds], ['claude-cli', 'claude-desktop'])
@@ -146,7 +146,7 @@ class DesktopVersionTests(unittest.TestCase):
         for candidate in ('', 'latest', '5.11\n5.12\n', '5.10;id', '5.10/../evil', '5' * 129,
                           subprocess.CalledProcessError(100, ['docker'], stderr='APT fixture failure')):
             with self.subTest(candidate=candidate):
-                self.assertEqual(self.build(['build', '--desktop', '--update-desktop'], candidate), 1)
+                self.assertEqual(self.build(['update', '--only-desktop'], candidate), 1)
                 self.assertIn('Claude Desktop', self.errors.getvalue())
                 self.assertEqual(self.pin.read_bytes(), b' 5.10-1\n')
                 current = self.pin.stat()
@@ -158,7 +158,7 @@ class DesktopVersionTests(unittest.TestCase):
         for raw in (b'latest\n', b'5.1-\n', b'5.1:bad-1\n', b'2:bad-1\n', b'5.1-%1\n'):
             with self.subTest(raw=raw):
                 self.pin.write_bytes(raw)
-                self.assertEqual(self.build(['build', '--update-desktop']), 1)
+                self.assertEqual(self.build(['update', '--only-desktop']), 1)
                 self.assertIn(str(self.pin), self.errors.getvalue())
                 self.assertEqual(self.pin.read_bytes(), raw)
                 self.assertFalse(self.builds)

@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -35,6 +37,7 @@ class InstallFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.home = self.root / "home"
         self.home.mkdir()
+        isolate_runtime_lock(self, self.root)
         self.env = {"HOME": str(self.home), "XDG_DATA_HOME": str(self.root / "data"),
                     "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_STATE_HOME": str(self.root / "state"),
                     "XDG_CACHE_HOME": str(self.root / "cache"), "PATH": os.defpath,

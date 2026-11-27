@@ -141,7 +141,7 @@ class CustomizeTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.env, clear=True), redirect_stderr(self.errors), \
                 patch.object(cli.CommandRunner, 'run', run):
-            self.assertEqual(cli.main(['-d', 'build', '--all']), 1)
+            self.assertEqual(cli.main(['-d', 'build']), 1)
         self.assertEqual(services, ['claude-cli', 'claude-desktop'])
         self.assertEqual(contexts[0], contexts[1])
         self.assertTrue(all(not target.exists() for target in contexts + overrides))

@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from claude_docker import cli
 
@@ -25,7 +27,7 @@ class ConfigReportingTests(unittest.TestCase):
 
     def test_paths_are_opt_in(self):
         self.write_config(self.default_file)
-        for command in ('claude', 'desktop', 'check', 'stop'):
+        for command in ('cli', 'desktop', 'check', 'stop'):
             with self.subTest(command=command):
                 status, _, quiet = self.invoke([command])
                 self.assertEqual(status, 0, quiet)
@@ -41,6 +43,7 @@ class ConfigReportingTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)
+        isolate_runtime_lock(self, self.home)
         self.env = {'HOME': str(self.home), 'XDG_CONFIG_HOME': str(self.home / 'xdg')}
         self.default_file = self.home / 'xdg/claude-docker/config.toml'
 
@@ -66,7 +69,7 @@ class ConfigReportingTests(unittest.TestCase):
     def test_inactive_tool_profile_collision_does_not_block_a_container_launch(self):
         self.write_config(self.default_file)
         for selected in (str(self.home / 'custom.lock'), 'invalid-relative'):
-            result, _, stderr = self.invoke(['claude'], dict(self.env, CLAUDE_MISE_CONFIG_FILE=selected))
+            result, _, stderr = self.invoke(['cli'], dict(self.env, CLAUDE_MISE_CONFIG_FILE=selected))
             self.assertEqual(result, 0, stderr)
 
     def invoke(self, arguments, env=None):
@@ -91,17 +94,17 @@ class ConfigReportingTests(unittest.TestCase):
     def test_commands_that_load_config_report_the_xdg_source_once(self):
         self.write_config(self.default_file)
         self.default_file.with_name('claude-code.version').write_text('2.1.326\n')
-        for args in (['claude'], ['desktop'], ['build'], ['rebuild'], ['pull'],
+        for args in (['cli'], ['desktop'], ['build', '--only-cli'], ['build', '--only-cli', '--rebuild'], ['pull'],
                      ['check'], ['tools', 'lock'], ['cleanup', 'inner-docker'], ['stop']):
             with self.subTest(command=args):
                 result, stdout, stderr = self.invoke(['-d', *args])
                 self.assertEqual(result, 0, stderr)
                 self.assertEqual(stderr.count(f'claude-docker: config: {self.default_file}\n'), 1)
-                if args[0] in ('claude', 'desktop', 'build', 'rebuild'):
+                if args[0] in ('cli', 'desktop', 'build', 'update'):
                     for label in ('launcher version:', 'base mise (build input):',
                                   'user mise (build input):', 'user customize (build input):'):
                         self.assertIn(label, stderr)
-                if args[0] in ('build', 'rebuild'):
+                if args[0] in ('build', 'update'):
                     self.assertIn('Claude Code version: 2.1.326', stderr)
                 self.assertNotIn(str(self.default_file), stdout)
 

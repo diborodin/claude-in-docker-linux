@@ -88,7 +88,7 @@ chown _apt "$work/download"
     cd "$work/download"
     # Apt authenticates the metadata and checks the .deb hash against it.
     apt_desktop apt-get download "$package=$version" \
-        || fail "Cannot download signed Claude Desktop $version for $arch. Try build --update-desktop."
+        || fail "Cannot download signed Claude Desktop $version for $arch. Try update --only-desktop."
     set -- ./*.deb
     if [ "$#" -ne 1 ] ||
         [ "$(dpkg-deb -f "$1" Package)" != claude-desktop ] ||

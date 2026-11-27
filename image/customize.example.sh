@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Optional example: runs as root inside both image builds.
-# Remove sections you do not need before running build --all.
+# Remove sections you do not need before running build.
 work_dir=$(mktemp -d)
 trap 'rm -rf -- "$work_dir"' EXIT
 cd -- "$work_dir"

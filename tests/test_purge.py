@@ -13,11 +13,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from claude_docker import __version__, cli, uninstall
 from claude_docker.config import AccountInfo, load_config
 from claude_docker.installer import InstallLayout, install_release, install_development
+from claude_docker.state import runtime_transition
 
 MANAGED = 'io.github.diborodin.claude-in-docker-linux.managed'
 OWNER = 'io.github.diborodin.claude-in-docker-linux.owner-uid'
@@ -79,6 +82,7 @@ class PurgeTests(unittest.TestCase):
         self.root = Path(temp.name)
         self.home = self.root / 'home'
         self.home.mkdir()
+        isolate_runtime_lock(self, self.root)
         runtime = self.root / 'runtime'
         runtime.mkdir(mode=0o700)
         env = {'HOME': str(self.home), 'XDG_CONFIG_HOME': str(self.root / 'config'),
@@ -275,6 +279,18 @@ class PurgeTests(unittest.TestCase):
         self.assertIn(target, report.retained)
         self.assertEqual(pin.readlink(), target)
         self.assertEqual(target.read_text(), '1:5.10-1\n')
+
+    def test_purge_refuses_a_busy_project_and_preserves_the_lock_when_selected_as_config(self):
+        lock = self.root / '.claude-docker-locks' / 'runtime-transition.lock'
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_FILE': str(lock)}):
+            with runtime_transition():
+                original = lock.stat()
+                with self.assertRaisesRegex(ValueError, '(?i)retry'):
+                    self.purge(yes=True)
+                self.assertEqual(self.docker.calls, [])
+            self.purge(yes=True)
+            self.assertTrue(lock.exists())
+            self.assertTrue(os.path.samestat(original, lock.stat()))
 
     def test_purge_retains_unreadable_customize_script_without_opening_it(self):
         hook = self.write(self.layout.host_paths.config_dir / 'customize.sh', 'invalid Bash (')

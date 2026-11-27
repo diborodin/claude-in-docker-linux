@@ -68,12 +68,12 @@ class HookTests(unittest.TestCase):
                     self.assertEqual(env, original)
                     self.assertEqual(selected, tuple(original))
 
-    def test_readme_aws_example_exports_credentials_and_aborts_on_aws_failure(self):
+    def test_documented_aws_example_exports_credentials_and_aborts_on_aws_failure(self):
         from claude_docker.hooks import launch_environment
         from claude_docker.model import EnvironmentConfig, HooksConfig
 
-        readme = (Path(__file__).resolve().parents[1] / 'README.md').read_text()
-        [example] = [body for body in re.findall(r'```bash\n(.*?)```', readme, re.S)
+        reference = (Path(__file__).resolve().parents[1] / 'docs/reference.md').read_text()
+        [example] = [body for body in re.findall(r'```bash\n(.*?)```', reference, re.S)
                      if 'aws sts get-federation-token' in body]
         policy = EnvironmentConfig(('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'), ())
         # A shell function supplies synthetic AWS output; no network or host AWS CLI.

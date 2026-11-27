@@ -102,6 +102,38 @@ class DesktopLaunchTests(ComposeFixture, unittest.TestCase):
     def chromium_config(self):
         return replace(self.config, desktop=replace(self.config.desktop, seccomp='chromium'))
 
+    def test_launch_restart_and_stop_leave_an_inflight_desktop_start_alone(self):
+        from claude_docker.clipboard import ClipboardSync
+
+        self.project().state.write_mode('none')
+        original = self.runner.run
+
+        def run(argv, **kwargs):
+            if argv[:2] == ['docker', 'exec'] and 'openbox' in argv:
+                # Compose startup has committed its mode, but the Desktop launch
+                # still owns setup of the display, app process and clipboard.
+                with patch.object(desktop.XephyrManager, 'load', return_value=self.runtime) as load, \
+                        patch.object(desktop, 'launch_environment',
+                                     side_effect=AssertionError('Busy Desktop start ran its hooks')), \
+                        patch.object(ClipboardSync, 'stop_recorded') as stop_sync:
+                    self.runner.running = True
+                    for restart in (False, True):
+                        with self.subTest(restart=restart), self.assertRaisesRegex(ValueError, '(?i)retry'):
+                            self.launch(restart=restart)
+                    with patch.object(cli, 'resolve_host_paths', return_value=self.paths), \
+                            patch.object(cli, 'load_config', return_value=self.config), \
+                            patch.object(cli, 'CommandRunner', return_value=self.runner):
+                        self.assertEqual(cli.main(['stop']), 1)
+                    self.assertIn('retry', self.stderr.getvalue().lower())
+                    load.assert_not_called()
+                    stop_sync.assert_not_called()
+            return original(argv, **kwargs)
+
+        with patch.object(self.runner, 'run', side_effect=run):
+            self.assertEqual(self.launch(), 0)
+        self.assertEqual(self.events, ['start'])
+        self.assertFalse(any('stop' in argv or 'down' in argv for argv, _ in self.runner.calls))
+
     def test_opt_in_launch_applies_cached_profile_and_warns(self):
         self.assertEqual(self.launch(self.chromium_config()), 0)
         services = json.loads((self.paths.runtime_dir / 'compose.none.json').read_text())['services']

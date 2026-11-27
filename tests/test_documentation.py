@@ -15,6 +15,8 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock
+
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / 'README.md'
@@ -30,15 +32,25 @@ HEADINGS = [
 class DocumentationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.text = README.read_text(encoding='utf-8')
-        # Example Markdown headings belong to the copied file, not the manual.
-        cls.prose = re.sub(r'^```[^\n]*\n.*?^```[ \t]*$',
-                           lambda match: re.sub(r'[^\n]', ' ', match.group()),
-                           cls.text, flags=re.M | re.S)
-        headings = list(re.finditer(r'^## ([^\n]+)$', cls.prose, re.M))
-        cls.sections = {match.group(1): cls.text[match.end():
-                        headings[index + 1].start() if index + 1 < len(headings) else len(cls.text)]
-                        for index, match in enumerate(headings)}
+        cls.readme = README.read_text(encoding='utf-8')
+        cls.documents = {README: cls.readme,
+                         ROOT / 'docs/reference.md': (ROOT / 'docs/reference.md').read_text(encoding='utf-8')}
+        cls.text = '\n\n'.join(cls.documents.values())
+
+        def prose(text):
+            # Headings inside copied examples do not belong to the manual.
+            return re.sub(r'^```[^\n]*\n.*?^```[ \t]*$',
+                          lambda match: re.sub(r'[^\n]', ' ', match.group()),
+                          text, flags=re.M | re.S)
+
+        cls.prose = prose(cls.readme)
+        cls.sections = {}
+        for text in cls.documents.values():
+            headings = list(re.finditer(r'^## ([^\n]+)$', prose(text), re.M))
+            for index, match in enumerate(headings):
+                end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+                cls.sections[match.group(1)] = (cls.sections.get(match.group(1), '') +
+                                                text[match.end():end])
         cls.shell = '\n'.join(re.findall(r'^[ \t]*```(?:bash|sh)\n(.*?)^[ \t]*```', cls.text, re.M | re.S))
 
     def section(self, heading):
@@ -84,7 +96,7 @@ class DocumentationTests(unittest.TestCase):
     def test_version_matches_package_and_executable_from_unrelated_directory(self):
         version = (ROOT / 'VERSION').read_text().strip()
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$')
-        self.assertEqual(version, '0.4.6')
+        self.assertEqual(version, '0.5.0')
         self.assertEqual(__version__, version)
         with tempfile.TemporaryDirectory() as directory:
             env = {'HOME': directory, 'PATH': '', 'PYTHONDONTWRITEBYTECODE': '1'}
@@ -132,7 +144,7 @@ class DocumentationTests(unittest.TestCase):
             self.assertEqual(generated.read_text(), example)
             self.assertEqual(stat.S_IMODE(generated.stat().st_mode), 0o600)
 
-    def test_readme_covers_every_public_command_path(self):
+    def test_linked_manual_covers_every_public_command_path(self):
         class Captured(Exception):
             pass
 
@@ -166,15 +178,17 @@ class DocumentationTests(unittest.TestCase):
     def test_navigation_and_size(self):
         self.assertEqual(HEADINGS, re.findall(r'^## (.+)$', self.prose, re.M))
         self.assertEqual(1, len(re.findall(r'^# [^#]', self.prose, re.M)))
-        # Allow the image update and host pre-launch workflows in the compact manual.
-        self.assertLessEqual(len(self.text.splitlines()), 790)
+        # Diagram source does not add prose to the short installation guide.
+        without_diagrams = re.sub(r'^```mermaid\n.*?^```[ \t]*$', '', self.readme, flags=re.M | re.S)
+        self.assertLessEqual(len(without_diagrams.splitlines()), 350)
+        self.assertIn('](docs/reference.md', self.readme)
         self.assertRegex(self.text, r'\]\((?:\./)?config\.example\.toml\)')
 
     def test_ordinary_install_and_cli_procedures_precede_optional_features(self):
         self.contains_all(self.section('Install'), ['./install', '$HOME/.local/bin', 'claude-docker config init',
                                                     'claude-docker tools init', 'claude-docker tools lock',
                                                     'claude-docker customize init', 'claude-docker build'])
-        self.contains_all(self.section('Start Claude'), ['claude-docker claude', 'claude-docker stop'])
+        self.contains_all(self.section('Start Claude'), ['claude-docker cli', 'claude-docker stop'])
         ordinary = self.section('Install') + self.section('Start Claude')
         self.assertNotRegex(ordinary, r'claude-docker (?:desktop|clipboard)|docker_mode\s*=\s*"sysbox"')
 
@@ -260,7 +274,7 @@ class DocumentationTests(unittest.TestCase):
 
     def test_desktop_policy_and_shared_profile_warning(self):
         desktop = self.section('Use Claude Desktop')
-        self.contains_all(desktop, ['manual', 'claude-docker clipboard push', 'claude-docker clipboard pull',
+        self.contains_all(desktop, ['manual', 'claude-docker desktop-clipboard push', 'claude-docker desktop-clipboard pull',
                                     '--clipboard-sync', '--no-sandbox', 'claude-docker desktop --restart'])
         self.assertRegex(desktop, r'(?is)shared.*profile.*lock')
         self.assertRegex(desktop, r'(?is)--no-sandbox.*unsafe')
@@ -286,7 +300,7 @@ class DocumentationTests(unittest.TestCase):
 
     def test_updates_and_contributor_tools_respect_immutable_bundles(self):
         update = self.section('Update or uninstall')
-        self.contains_all(update, ['./install', 'claude-docker rebuild', 'claude-docker stop',
+        self.contains_all(update, ['./install', 'claude-docker build --rebuild', 'claude-docker stop',
                                    './claude-docker tools lock', 'trusted source', 'immutable'])
         self.assertRegex(update, r'(?i)contributor')
 
@@ -346,20 +360,29 @@ class DocumentationTests(unittest.TestCase):
                                              '!image/mise-user-graphs/**/uv.lock', '!image/mise-user-graphs/**/pyproject.toml'])
 
     def test_repository_file_references_exist(self):
-        references = set(re.findall(r'\]\(([^)]+)\)', self.text))
-        for token in re.findall(r'`([^`\n]+)`', self.text):
-            # HOME/XDG and absolute host/container paths are generated data,
-            # not references to files in the checkout.
-            if (not re.search(r'\s', token) and not token.startswith(('~', '$', '/'))
-                    and (token.startswith('./') or Path(token).suffix in ('.toml', '.yaml', '.sh', '.md'))):
-                references.add(token)
+        references = set()
+        for document, text in self.documents.items():
+            for reference in re.findall(r'\]\(([^)]+)\)', text):
+                if '://' in reference or reference.startswith('#'):
+                    continue
+                path, _, anchor = reference.partition('#')
+                target = (document.parent / path).resolve()
+                with self.subTest(document=document.name, reference=reference):
+                    self.assertTrue(target.is_file(), reference)
+                    references.add(str(target.relative_to(ROOT)))
+                    if anchor and target.suffix == '.md':
+                        headings = re.findall(r'^#{1,6} (.+)$', target.read_text(), re.M)
+                        slugs = {re.sub(r'[^\w -]', '', heading.lower()).replace(' ', '-')
+                                 for heading in headings}
+                        self.assertIn(anchor, slugs)
+            for token in re.findall(r'`([^`\n]+)`', text):
+                if (not re.search(r'\s', token) and not token.startswith(('~', '$', '/'))
+                        and (token.startswith('./') or Path(token).suffix in ('.toml', '.yaml', '.sh', '.md'))):
+                    with self.subTest(reference=token):
+                        self.assertTrue((ROOT / token).is_file(), token)
+                    references.add(token.removeprefix('./'))
         self.assertIn('config.example.toml', references)
         self.assertIn('image/customize.sh', references)
-        for reference in references:
-            if '://' in reference or reference.startswith('#'):
-                continue
-            with self.subTest(reference=reference):
-                self.assertTrue((ROOT / reference.split('#')[0]).is_file(), reference)
 
     def documented_commands(self):
         candidates = self.shell.splitlines() + re.findall(r'`([^`\n]+)`', self.text)
@@ -390,7 +413,7 @@ class DocumentationTests(unittest.TestCase):
             raise Parsed
 
         # Stop at the real parser boundary: no configuration, Docker, clipboard,
-        # installer or deletion operation is reachable, including claude --help.
+        # installer or deletion operation is reachable, including cli --help.
         with patch.object(argparse.ArgumentParser, 'parse_args', stop_after_parse):
             with self.assertRaises(Parsed):
                 if executable == 'install':
@@ -402,6 +425,7 @@ class DocumentationTests(unittest.TestCase):
     def test_documented_claude_tails_reach_application_unchanged_without_docker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            isolate_runtime_lock(self, root)
             runtime = root / 'runtime'
             runtime.mkdir(mode=0o700)
             config = root / 'config.toml'
@@ -418,7 +442,7 @@ class DocumentationTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, 'fixture-container\n', '')
 
             for executable, *arguments in self.documented_commands():
-                if executable != 'claude-docker' or arguments[:1] != ['claude']:
+                if executable != 'claude-docker' or arguments[:1] != ['cli']:
                     continue
                 with self.subTest(arguments=arguments):
                     calls.clear()
@@ -455,12 +479,15 @@ class DocumentationTests(unittest.TestCase):
                         self.assertIn('usage:', help_for(executable, []))
                         continue  # argparse help exits before returning a namespace.
                     parsed_args, parsed = self.parse_without_action(executable, arguments)
-                    if executable == 'claude-docker' and arguments:
-                        self.assertRegex(help_for(executable, []), rf'\b{re.escape(arguments[0])}\b')
-                    if arguments[:1] == ['claude']:
-                        self.assertEqual(parsed.command, 'claude')
-                        self.assertEqual(parsed_args, ['claude'], 'Claude tail belongs to the application')
-                        continue  # claude --help would launch the application.
+                    command_arguments = list(arguments)
+                    while command_arguments[:1] in (['-d'], ['--debug']):
+                        command_arguments.pop(0)
+                    if executable == 'claude-docker' and command_arguments:
+                        self.assertRegex(help_for(executable, []), rf'\b{re.escape(command_arguments[0])}\b')
+                    if arguments[:1] == ['cli']:
+                        self.assertEqual(parsed.command, 'cli')
+                        self.assertEqual(parsed_args, ['cli'], 'Claude tail belongs to the application')
+                        continue  # cli --help would launch the application.
                     words = [word for word in arguments if not word.startswith('-')]
                     help_text = help_for(executable, words)
                     for option in (word for word in arguments if word.startswith('--')):
@@ -471,7 +498,7 @@ class DocumentationTests(unittest.TestCase):
             for heading, command_words in (
                     ('Use Claude Desktop', ['desktop']),
                     ('Check the system', ['check']),
-                    ('Update or uninstall', ['rebuild'])):
+                    ('Update or uninstall', ['update'])):
                 help_text = help_for('claude-docker', command_words)
                 if heading == 'Update or uninstall':
                     help_text += help_for('claude-docker', ['uninstall']) + help_for('install', [])

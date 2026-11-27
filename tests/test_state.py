@@ -1,16 +1,20 @@
 """Successful mode and pending recovery records survive partial failures."""
 
 from dataclasses import replace
+import multiprocessing
 import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from tests.test_compose import ComposeFixture
-from claude_docker.state import RuntimeState
+from claude_docker.compose import ComposeProject
+from claude_docker.state import RuntimeState, runtime_transition, runtime_transition_lock_path
 
 
 class RuntimeStateTests(unittest.TestCase):
@@ -68,7 +72,192 @@ class RuntimeStateTests(unittest.TestCase):
             self.state.write_mode('unknown-mode')
 
 
+class RuntimeTransitionLockTests(ComposeFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.directory = self.root / '.claude-docker-locks'
+        self.path = self.directory / 'runtime-transition.lock'
+
+    def test_lock_inode_stays_private_and_stable_after_an_exception(self):
+        with self.assertRaisesRegex(RuntimeError, 'launch failed'):
+            with runtime_transition():
+                original = self.path.stat()
+                raise RuntimeError('launch failed')
+        with runtime_transition():
+            self.assertTrue(os.path.samestat(self.path.stat(), original))
+            self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
+
+    def test_exec_child_cannot_hold_the_lock_open_after_owner_releases_it(self):
+        with runtime_transition():
+            child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                     stdin=subprocess.PIPE, close_fds=False)
+        try:
+            self.assertIsNone(child.poll())
+            with runtime_transition():
+                self.assertIsNone(child.poll())
+        finally:
+            child.communicate(timeout=10)
+
+    def test_distinct_lock_directories_do_not_contend(self):
+        other_root = self.root / 'other'
+        other_root.mkdir(mode=0o700)
+        with runtime_transition(), patch('claude_docker.state.getpwuid',
+                                         return_value=SimpleNamespace(pw_dir=str(other_root))):
+            with runtime_transition():
+                self.assertTrue((other_root / self.path.relative_to(self.root)).is_file())
+
+    def test_lock_directory_symlink_is_rejected_without_modifying_target(self):
+        target = self.root / 'other'
+        target.mkdir()
+        target.chmod(0o755)
+        self.directory.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'runtime transition lock'):
+            self.project().up('claude-cli')
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.assertEqual(self.runner.calls, [])
+
+    def test_unsafe_lock_objects_are_rejected_without_modifying_target(self):
+        target = self.root / 'other'
+        target.write_text('keep')
+        target.chmod(0o600)
+        self.directory.mkdir(mode=0o700)
+        for create_lock in (lambda: self.path.symlink_to(target),
+                            lambda: self.path.hardlink_to(target),
+                            lambda: os.mkfifo(self.path, 0o600)):
+            with self.subTest(create_lock=create_lock):
+                create_lock()
+                with self.assertRaisesRegex(ValueError, '(?i)runtime .*lock'):
+                    self.project().up('claude-cli')
+                self.assertEqual(self.runner.calls, [])
+                self.assertEqual(target.read_text(), 'keep')
+                self.path.unlink()
+
+    def test_foreign_owned_lock_is_rejected(self):
+        self.directory.mkdir(mode=0o700)
+        self.path.touch(mode=0o600)
+        fstat = os.fstat
+
+        def foreign_file_owner(descriptor):
+            info = fstat(descriptor)
+            if stat.S_ISREG(info.st_mode):
+                values = list(info)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return info
+
+        with patch('claude_docker.state.os.fstat', side_effect=foreign_file_owner):
+            with self.assertRaisesRegex(ValueError, 'owned'):
+                self.project().up('claude-cli')
+        self.assertEqual(self.runner.calls, [])
+
+
+class RuntimeLockAnchorTests(unittest.TestCase):
+    def test_environment_overrides_cannot_select_a_different_runtime_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            with patch('claude_docker.state.getpwuid',
+                       return_value=SimpleNamespace(pw_dir=str(home))), \
+                    patch.dict(os.environ, {'HOME': '/different-home', 'XDG_STATE_HOME': '/different-state',
+                                            'XDG_RUNTIME_DIR': '/different-runtime'}, clear=True):
+                self.assertEqual(runtime_transition_lock_path(),
+                                 home / '.claude-docker-locks' / 'runtime-transition.lock')
+
+    def test_unsafe_home_anchor_is_rejected_before_creating_lock_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            home.chmod(0o770)
+            with patch('claude_docker.state.getpwuid',
+                       return_value=SimpleNamespace(pw_dir=str(home))):
+                with self.assertRaisesRegex(ValueError, '(?i)account home'):
+                    with runtime_transition():
+                        self.fail('Lock acquired under a group-writable account home')
+            self.assertEqual(list(home.iterdir()), [])
+
+    def test_account_home_symlink_can_point_to_an_owned_private_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / 'real-home'
+            home.mkdir(mode=0o700)
+            link = root / 'home'
+            link.symlink_to(home, target_is_directory=True)
+            with patch('claude_docker.state.getpwuid',
+                       return_value=SimpleNamespace(pw_dir=str(link))), runtime_transition():
+                self.assertTrue((home / '.claude-docker-locks' / 'runtime-transition.lock').is_file())
+
+    def test_setgid_home_preserves_private_lock_and_reuses_its_inode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            home.chmod(0o2750)
+            with patch('claude_docker.state.getpwuid',
+                       return_value=SimpleNamespace(pw_dir=str(home))):
+                lock = home / '.claude-docker-locks' / 'runtime-transition.lock'
+                with runtime_transition():
+                    original = lock.stat()
+                    self.assertEqual(stat.S_IMODE(lock.parent.stat().st_mode), 0o2700)
+                with runtime_transition():
+                    self.assertTrue(os.path.samestat(lock.stat(), original))
+
+
 class ModeTransitionTests(ComposeFixture, unittest.TestCase):
+    def test_concurrent_start_cannot_consume_pending_mode_from_live_owner(self):
+        project = self.project()
+        context = multiprocessing.get_context('fork')
+        ready, signal = context.Pipe(duplex=False)
+        resume = context.Event()
+
+        def start():
+            run = project.runner.run
+
+            def pause_before_up(argv, **kwargs):
+                if 'up' in argv:
+                    signal.send('starting')
+                    if not resume.wait(10):
+                        raise TimeoutError('Test did not release the first start')
+                return run(argv, **kwargs)
+
+            project.runner.run = pause_before_up
+            project.up('claude-cli')
+
+        owner = context.Process(target=start)
+        owner.start()
+        try:
+            self.assertTrue(ready.poll(10), 'First start never reached Docker up')
+            self.assertEqual(ready.recv(), 'starting')
+            self.assertTrue((self.root / '.claude-docker-locks/runtime-transition.lock').is_file())
+            self.assertEqual(project.state.read_pending(), 'none')
+            # A caller must leave both Docker and the active start's record alone.
+            try:
+                self.project().up('claude-cli')
+            except ValueError as error:
+                self.assertRegex(str(error), '(?i)retry')
+            else:
+                self.fail(f'Concurrent start reached Docker: {[argv[-1] for argv, _ in self.runner.calls]}')
+            self.assertEqual(self.runner.calls, [])
+            self.assertEqual(project.state.read_pending(), 'none')
+            with self.assertRaisesRegex(ValueError, '(?i)retry'):
+                project.down()
+            different_paths = replace(self.paths, state_dir=self.root / 'another-state',
+                                      runtime_dir=self.root / 'another-runtime')
+            same_project = ComposeProject(self.config, different_paths, project.mounts,
+                                          self.runner, program_dir=ROOT)
+            with self.assertRaisesRegex(ValueError, '(?i)retry'):
+                same_project.up('claude-cli')
+            self.assertFalse(different_paths.state_dir.exists())
+            self.assertFalse(different_paths.runtime_dir.exists())
+            self.assertEqual(self.runner.calls, [])
+        finally:
+            owner.terminate()
+            owner.join(timeout=10)
+            for connection in (ready, signal):
+                connection.close()
+
+        self.assertFalse(owner.is_alive())
+        self.project().up('claude-cli')
+        self.assertEqual([argv[-1] for argv, _ in self.runner.calls], ['down', 'claude-cli'])
+        self.assertIsNone(project.state.read_pending())
+
     def test_no_prior_mode_and_same_mode_start_without_old_shutdown(self):
         project = self.project()
         state = RuntimeState(self.paths.state_dir)

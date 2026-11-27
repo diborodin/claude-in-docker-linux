@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock, runtime_script_args
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from claude_docker.cli import main
 from claude_docker.process import docker_exec_argv
@@ -47,8 +49,8 @@ class LaunchTests(unittest.TestCase):
     def test_global_debug_preserves_code_debug_argument(self):
         for flag in ('-d', '--debug'):
             with self.subTest(flag=flag):
-                result = subprocess.run([sys.executable, str(ROOT / 'claude-docker'), flag,
-                                         'claude', '-d', '--model', 'literal value'],
+                result = subprocess.run(runtime_script_args(self.root, ROOT / 'claude-docker', flag,
+                                                             'cli', '-d', '--model', 'literal value'),
                                         env=self.env, cwd=self.caller, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 37, result.stderr)
                 self.assertIn(str(self.config_file), result.stderr)
@@ -60,6 +62,7 @@ class LaunchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        isolate_runtime_lock(self, self.root)
         self.workspace = self.root / 'workspace with space'
         self.caller = self.workspace / 'project'
         self.caller.mkdir(parents=True)
@@ -113,7 +116,7 @@ if 'ps' in args:
                                             for name, value in values.items()}))
 
     def invoke(self, args=(), env=None, input=None):
-        return subprocess.run([sys.executable, str(ROOT / 'claude-docker'), 'claude', *args],
+        return subprocess.run(runtime_script_args(self.root, ROOT / 'claude-docker', 'cli', *args),
                               env=self.env if env is None else env, cwd=self.caller,
                               text=True, capture_output=True, input=input)
 
@@ -202,7 +205,7 @@ if 'ps' in args:
                     patch('logging.Logger._log') as diagnostics, \
                     redirect_stdout(stdout), redirect_stderr(stderr):
                 with patch.object(stdout, 'isatty', return_value=stdout_tty):
-                    self.assertEqual(main(['claude', '--help']), 37)
+                    self.assertEqual(main(['cli', '--help']), 37)
                 exec_argv, kwargs = calls[-1]
                 self.assertEqual(exec_argv[:2 + len(flags)], ['docker', 'exec', *flags])
                 self.assertIsNone(kwargs.get('env'))
@@ -219,7 +222,7 @@ if 'ps' in args:
                 patch('subprocess.run', side_effect=subprocess.CalledProcessError(7, ['docker', 'compose'])), \
                 patch('logging.Logger._log') as diagnostics, \
                 redirect_stdout(stdout), redirect_stderr(stderr):
-            self.assertEqual(main(['claude']), 1)
+            self.assertEqual(main(['cli']), 1)
         self.assertIn('exit 7', stderr.getvalue())
         for output in (stdout.getvalue(), stderr.getvalue(), repr(diagnostics.call_args_list)):
             self.assertNotIn('task5-unique-secret-sentinel', output)

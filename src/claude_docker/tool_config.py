@@ -276,7 +276,7 @@ def init_user_tools(paths: HostPaths, env: Mapping[str, str]) -> Path:
     fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'wb') as stream:
         stream.write(b'''# Optional image tools. Remove entries you do not need.
-# Run tools lock, then build --all. Existing profiles are never overwritten.
+# Run tools lock, then build. Existing profiles are never overwritten.
 [tools]
 kubectl = "1.36"
 aws-cli = "2"

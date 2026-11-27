@@ -26,6 +26,7 @@ from .process import docker_exec_argv
 from .paths import (HostPaths, _private_runtime, desktop_socket_dir, resolve_host_paths,
                     resolve_program_dir)
 from .seccomp import resolve_desktop_seccomp
+from .state import runtime_transition
 
 _X11_DIR = Path('/tmp/.X11-unix')
 _PROC_ROOT = Path('/proc')
@@ -618,6 +619,7 @@ def _configure_keyboard(runtime: DesktopRuntime, settings: DesktopConfig, runtim
     raise ValueError('Cannot configure the nested Desktop keyboard. Check the XKB layout and options.') from None
 
 
+@runtime_transition()
 def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
                    no_sandbox: bool, app_args: Sequence[str]) -> int:
     """Launch a detached Desktop with fresh process-scoped host credentials."""
@@ -705,10 +707,10 @@ def launch_desktop(config: AppConfig, *, restart: bool, clipboard_sync: bool,
             if old_mode is None:
                 project.state.write_mode_if_absent(config.docker_mode)
         elif config.docker_mode == 'sysbox':
-            project.up('claude-desktop', before_start=prepare_runtime)
+            project._up('claude-desktop', before_start=prepare_runtime)
         else:
             prepare_runtime()
-            project.up('claude-desktop')
+            project._up('claude-desktop')
         container = project.container_id('claude-desktop')
         project.report_versions(container, desktop=True)
         socket_check = docker_exec_argv(container, ['test', '-S', f'/tmp/.X11-unix/X{runtime.display}'],

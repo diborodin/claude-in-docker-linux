@@ -17,6 +17,8 @@ from textwrap import dedent
 import time
 import unittest
 from unittest.mock import patch
+
+from tests import isolate_runtime_lock
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,6 +152,7 @@ class DesktopIntegrationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix='claude-xephyr-launcher-', dir='/tmp') as temporary:
                 temporary_path = Path(temporary)
                 root = temporary_path
+                isolate_runtime_lock(self, root)
                 for name in ['config', 'data', 'state', 'cache', 'runtime', 'x11', 'workspace']:
                     (root / name).mkdir(mode=0o700)
                 (root / 'workspace/marker').write_text('isolated-workspace\n')
@@ -417,6 +420,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         # cannot cross filesystems. No production socket directory is touched.
         with tempfile.TemporaryDirectory(prefix='claude-desktop-smoke-', dir='/tmp') as temporary:
             root = Path(temporary)
+            isolate_runtime_lock(self, root)
             for name in ('home', 'config', 'data', 'state', 'cache', 'runtime', 'x11'):
                 (root / name).mkdir(mode=0o700)
             environment.update(HOME=str(root / 'home'), XDG_CONFIG_HOME=str(root / 'config'),

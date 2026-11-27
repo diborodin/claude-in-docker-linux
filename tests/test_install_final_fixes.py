@@ -6,12 +6,12 @@ import subprocess
 import sys
 import unittest
 
-from tests import test_install_lifecycle as lifecycle
+from tests import ACCOUNT_HOME_BOOTSTRAP, test_install_lifecycle as lifecycle
 
 ROOT = lifecycle.ROOT
 
 # Fault/pause hooks live in this subprocess harness, never the product API.
-HARNESS = r'''
+HARNESS = ACCOUNT_HOME_BOOTSTRAP + r'''
 import runpy, sys
 from pathlib import Path
 from unittest.mock import patch
@@ -61,7 +61,8 @@ class FinalInstallFixTests(unittest.TestCase):
     snapshot = lifecycle.InstallLifecycleTests.snapshot
 
     def invoke(self, *arguments, hook='none', target='-', prefix='-', popen=False):
-        command = [sys.executable, '-c', HARNESS, str(self.source / 'install'), str(prefix), hook, str(target), *arguments]
+        command = [sys.executable, '-c', HARNESS, str(self.root), str(self.source / 'install'),
+                   str(prefix), hook, str(target), *arguments]
         if popen:
             process = subprocess.Popen(command, env=self.env, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

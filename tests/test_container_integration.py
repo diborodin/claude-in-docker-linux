@@ -12,6 +12,8 @@ import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
+
+from tests import isolate_runtime_lock
 import uuid
 
 
@@ -272,6 +274,7 @@ class ContainerIntegrationTests(unittest.TestCase):
                                   "SSL_CERT_FILE", "SSL_CERT_DIR")}
         with tempfile.TemporaryDirectory(prefix="claude-cli-smoke-") as temporary:
             root = Path(temporary)
+            isolate_runtime_lock(self, root)
             for name in ("config", "data", "state", "cache", "runtime", "workspace", "code"):
                 (root / name).mkdir(mode=0o700)
             workspace = root / "workspace"
@@ -327,7 +330,7 @@ optional = ["RELEASE_SMOKE_EMPTY", "RELEASE_SMOKE_ABSENT"]
                   patch.object(cli, "CommandRunner", ObservedRunner)):
                 try:
                     os.chdir(workspace)
-                    self.assertEqual(cli.main(["claude", "--version"]), 0)
+                    self.assertEqual(cli.main(["cli", "--version"]), 0)
                     container = self.command("docker", "ps", "-q", "--filter",
                                              f"label=com.docker.compose.project={project_name}")
                     self.assertTrue(container)

@@ -46,7 +46,7 @@ with patch.object(claude_version, '_RESOLVE_TIMEOUT', 1.5, create=True), \\
         patch('subprocess.Popen', side_effect=spawn):
     if scenario not in ('dns', 'body', 'environment'):
         with patch.object(cli.ComposeProject, 'build', side_effect=AssertionError('Docker build reached')):
-            raise SystemExit(cli.main(['build', '--update-claude']))
+            raise SystemExit(cli.main(['update', '--only-cli']))
     try:
         print(claude_version.update_code_version(Path(program), paths))
     except ValueError as error:
@@ -258,8 +258,8 @@ class CodeResolverProcessTests(unittest.TestCase):
         for name in ('sitecustomize.py', 'claude_docker.py'):
             (self.root / name).write_text("raise AssertionError('untrusted startup')\n")
         layout = InstallLayout.user(self.env)
-        install_release(ROOT, layout, version='0.4.6')
-        program = layout.release_dir('0.4.6')
+        install_release(ROOT, layout, version='0.5.0')
+        program = layout.release_dir('0.5.0')
         with self.stderr.open('w') as stderr, self.start(stderr, 'environment', program) as process:
             stdout, _ = process.communicate(timeout=4)
             self.assertEqual(process.returncode, 0, self.stderr.read_text())

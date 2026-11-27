@@ -13,7 +13,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
-from tests import test_desktop, test_desktop_cli
+from tests import isolate_runtime_lock, test_desktop, test_desktop_cli
 from tests.test_compose import ComposeFixture
 from tests.test_compose import RecordingRunner
 from claude_docker import cli, desktop, clipboard
@@ -28,6 +28,7 @@ class RecordedCleanupTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.manager = self.fixture.manager
         self.paths = self.fixture.paths
+        isolate_runtime_lock(self, self.paths.home)
         self.runtime = self.fixture.start()
         patch.object(desktop, '_desktop_socket_path', return_value=self.runtime.socket_dir).start()
 
@@ -462,7 +463,7 @@ class LaunchCleanupTests(ComposeFixture, unittest.TestCase):
     def test_interrupted_partial_launch_stops_service_and_new_display(self):
         def interrupted(*args, **kwargs):
             raise KeyboardInterrupt
-        with patch.object(desktop.ComposeProject, 'up', side_effect=interrupted):
+        with patch.object(desktop.ComposeProject, '_up', side_effect=interrupted):
             with self.assertRaises(KeyboardInterrupt):
                 self.launch()
         self.assertEqual(self.events, ['start', 'stop'])

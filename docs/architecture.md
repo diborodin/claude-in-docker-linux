@@ -78,11 +78,13 @@ Both targets copy the root-owned mode `0555` binary to `/usr/local/bin/claude`
 after package installation, mise, and customization. The runtime environment sets
 `DISABLE_UPDATES=1`. Changing only the selected version changes the artifact
 download and final copy, so `build` can reuse package, tool, and hook layers.
-`rebuild` skips the cache.
+`build --rebuild` pulls fresh base images and skips the cache.
+`build` and `update` default to both images; `--only-cli` and
+`--only-desktop` select one image. `update --rebuild` also skips the cache.
 
 The first launcher build resolves the latest official release and saves its
 exact version in the user's XDG configuration directory. Later builds use
-that pin. `build --update-claude` and `rebuild --update-claude` check the release
+that pin. `update` and `update --only-cli` check the Code release
 once and keep a newer saved version. A local Python worker requests the official
 latest metadata over verified HTTPS. It accepts only a complete HTTP 200
 response with a valid numeric version and rejects redirects. The worker sends
@@ -99,7 +101,7 @@ use the shipped `latest` policy
 in `image/claude-code.version`. They resolve it when the artifact layer
 runs, which can be skipped on a Docker cache hit.
 
-For Desktop targets, the first launcher build or an explicit `--update-desktop`
+For Desktop targets, the first launcher build, `update`, or `update --only-desktop`
 runs a temporary container on the selected Docker daemon to resolve the native
 signed Anthropic apt candidate. The daemon caches an Ubuntu helper keyed by its
 recipe, script, and architecture. The helper and Desktop package stage copy the
@@ -160,7 +162,7 @@ request leaves old graphs inert; it does not block future locks or builds.
 Python sidecars are user-only; the baseline keeps binary artifact locks.
 
 Build never resolves or refreshes locks. It validates and snapshots exact inputs
-in a private temporary context shared by both products for `build --all`.
+in a private temporary context shared by both products for `build` or `update`.
 The Dockerfile and filtered image inputs are the only admitted files; no whole
 HOME, configuration directory, or workspace is sent to Docker. Both products
 install baseline and user tools in system paths outside mounted HOME.
@@ -192,6 +194,15 @@ Probe failure prints `unavailable` and does not block the application launch.
 identity and a runtime override with validated mounts and selected settings.
 Desktop is a separate Compose profile. Resource labels record project ownership
 and host UID.
+
+A nonblocking lock for the host UID's Compose project covers launcher startup,
+Desktop reuse and restart, and teardown. The lock lives in a private
+`.claude-docker-locks` directory under the host account's home, as recorded in
+the account database, so it coordinates launches with different HOME or XDG
+paths. A competing command exits with a retry diagnostic
+before running launch hooks or changing runtime state. The lock is released
+before interactive Claude Code execution. The next launch can recover a pending
+mode after the process that recorded it exits.
 
 `docker_mode = "none"` is the default. The optional `compose.sysbox.yaml` overlay
 provides a separate inner Docker daemon, mutual TLS, and named storage. It needs

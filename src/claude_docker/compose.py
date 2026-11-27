@@ -16,7 +16,7 @@ from .model import (AppConfig, BindMount, ContainerConfig, DesktopConfig, Deskto
                     EnvironmentConfig, StateMountConfig)
 from .paths import HostPaths, _private_runtime, resolve_program_dir
 from .process import docker_exec_argv
-from .state import RuntimeState
+from .state import RuntimeState, runtime_transition
 
 
 _SERVICES = ('claude-cli', 'claude-desktop')
@@ -169,9 +169,15 @@ class ComposeProject:
         project._teardown_only = self._teardown_only
         return project
 
+    @runtime_transition()
     def up(self, service: str, *, recreate: bool = False,
            before_start: Callable[[], None] | None = None) -> None:
         """Start an app, with optional Desktop runtime setup after dependency readiness."""
+        self._up(service, recreate=recreate, before_start=before_start)
+
+    def _up(self, service: str, *, recreate: bool = False,
+            before_start: Callable[[], None] | None = None) -> None:
+        """Start an app while the caller holds the runtime transition lock."""
         self._service(service)
         # Validate the desired model before stopping a working old model.
         if before_start is None:
@@ -214,7 +220,7 @@ class ComposeProject:
         try:
             self._run(*options, service)
         except subprocess.CalledProcessError:
-            selection = ' --desktop' if service == 'claude-desktop' else ''
+            selection = ' --only-desktop' if service == 'claude-desktop' else ' --only-cli'
             print(f'claude-docker: If the image is missing, run claude-docker build{selection} first',
                   file=sys.stderr)
             raise
@@ -262,10 +268,12 @@ class ComposeProject:
         self._service(service)
         self._run('stop', service, runtime_mounts=False)
 
+    @runtime_transition()
     def remove_containers(self) -> None:
         """Remove owned project containers, retaining networks/images/volumes."""
         self._teardown('rm', '--stop', '--force')
 
+    @runtime_transition()
     def down(self) -> None:
         self._teardown('down')
 
@@ -289,6 +297,7 @@ class ComposeProject:
             self.runner.run(['docker', 'container', 'rm', *identifiers], env=self.environment)
 
     def _teardown(self, *operation: str) -> None:
+        """Tear down Compose resources while the caller holds the transition lock."""
         modes = tuple(dict.fromkeys(mode for mode in (
             self.state.read_pending(), self.state.read_mode()) if mode is not None))
         if self._teardown_only and not modes:

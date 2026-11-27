@@ -23,7 +23,7 @@ from .installer import (InstallLayout, _check_link, _exists, _owned_directory, _
                         installation_lock, _write_json, _sync_directory)
 from .model import AppConfig
 from .manifest import InstallManifest, InstallationRegistry, _read_metadata, validate_version
-from .state import RuntimeState
+from .state import RuntimeState, runtime_transition, runtime_transition_lock_path
 from .tool_config import retained_user_tools_paths
 
 
@@ -477,7 +477,7 @@ def uninstall_user(layout: InstallLayout, *, purge: bool = False, yes: bool = Fa
         raise ValueError('Shared system installation requires: sudo /usr/local/share/claude-docker/current/install --uninstall --system')
     if layout.host_paths is None:
         raise ValueError('User and development uninstall require explicit host paths')
-    with installation_lock(layout):
+    with installation_lock(layout), runtime_transition():
         layout = public_layout(Path(__file__), layout)
         return _uninstall_user(layout, purge=purge, yes=yes)
 
@@ -492,6 +492,9 @@ def _uninstall_user(layout: InstallLayout, *, purge: bool, yes: bool) -> Uninsta
     existing_generated = tuple(path for path in generated if _exists(path))
     paths = layout.host_paths
     protected = _protected_data(layout, purge=purge)
+    if purge:
+        # An explicit config path can otherwise select the lock for deletion.
+        protected += _aliases((runtime_transition_lock_path(),))
     if plan:
         protected = tuple(dict.fromkeys((*protected, *(Path(path) for path in plan['protected']))))
     directories = tuple(path for path in (paths.runtime_dir, paths.cache_dir) if _exists(path))
@@ -534,7 +537,7 @@ def _uninstall_user(layout: InstallLayout, *, purge: bool, yes: bool) -> Uninsta
                 failures.extend(_purge_resources(resources, runner))
             else:
                 try:
-                    project.remove_containers()
+                    project._teardown('rm', '--stop', '--force')
                 except (ValueError, OSError, subprocess.SubprocessError):
                     failures.append('Owned container cleanup failed')
         if failures:

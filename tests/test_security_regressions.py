@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolate_runtime_lock
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 from tests.test_compose import ComposeFixture
@@ -118,7 +120,7 @@ class DesktopPolicyBoundaryTests(ComposeFixture, unittest.TestCase):
               patch.object(cli, 'CommandRunner', return_value=self.runner),
               patch('claude_docker.seccomp_cache.resolve_cached_profile', side_effect=AssertionError('policy lookup')),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-            self.assertEqual(cli.main(['claude', '--help']), 0)
+            self.assertEqual(cli.main(['cli', '--help']), 0)
         model = json.loads((self.paths.runtime_dir / 'compose.sysbox.json').read_text())
         for service in model['services'].values():
             for forbidden in ('security_opt', 'privileged', 'cap_add', 'devices', 'network_mode'):
@@ -172,6 +174,7 @@ class TemporaryBoundarySecurityTests(unittest.TestCase):
             root = Path(directory)
             home = root / 'home'
             home.mkdir()
+            isolate_runtime_lock(self, root)
             sentinel = home / 'user-data'
             sentinel.write_text('retain')
             layout = InstallLayout.user({'HOME': str(home)})

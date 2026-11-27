@@ -255,7 +255,7 @@ class ClipboardTests(unittest.TestCase):
                     patch.object(cli, 'CommandRunner') as runner, \
                     patch.object(self.clipboard.subprocess, 'run', side_effect=self.run_xclip), \
                     redirect_stdout(self.output), redirect_stderr(self.error):
-                self.assertEqual(cli.main(['clipboard', direction]), 0)
+                self.assertEqual(cli.main(['desktop-clipboard', direction]), 0)
             config.assert_not_called()
             runner.assert_not_called()
             self.assertEqual(len(self.calls), 3)
@@ -275,7 +275,7 @@ class ClipboardTests(unittest.TestCase):
         with patch.object(cli, 'resolve_host_paths', return_value=self.paths), \
                 patch.object(cli, 'load_config') as config, \
                 patch.object(desktop.XephyrManager, 'load', return_value=None), redirect_stderr(self.error):
-            self.assertEqual(cli.main(['clipboard', 'push']), 1)
+            self.assertEqual(cli.main(['desktop-clipboard', 'push']), 1)
         config.assert_not_called()
         self.assertIn('runtime', self.error.getvalue())
 

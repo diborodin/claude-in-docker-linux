@@ -87,7 +87,7 @@ class ClaudeVersionTests(unittest.TestCase):
         return result
 
     def build(self, arguments, response=None, *, fail=False, edit_after_cli=False):
-        if '--desktop' in arguments or '--all' in arguments:
+        if '--only-cli' not in arguments:
             self.pin.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.pin.with_name('claude-desktop.version').write_text('5.11492.5\n')
 
@@ -118,7 +118,8 @@ class ClaudeVersionTests(unittest.TestCase):
 
         with patch.dict(os.environ, self.env, clear=True), redirect_stderr(self.errors), \
                 patch('urllib.request.OpenerDirector.open', side_effect=request) as fetch, \
-                patch.object(cli.CommandRunner, 'run', run):
+                patch.object(cli.CommandRunner, 'run', run), \
+                patch('claude_docker.image_tools.select_desktop_version', return_value='5.11492.5'):
             try:
                 result = cli.main(arguments)
             except SystemExit as error:
@@ -127,12 +128,12 @@ class ClaudeVersionTests(unittest.TestCase):
         return result
 
     def test_first_ordinary_build_saves_latest_once_for_both_products(self):
-        self.assertEqual(self.build(['build', '--all'], b'2.2.1\n'), 0, self.errors.getvalue())
+        self.assertEqual(self.build(['build'], b'2.2.1\n'), 0, self.errors.getvalue())
         self.assertEqual([entry[0] for entry in self.builds], ['claude-cli', 'claude-desktop'])
         self.assertEqual({entry[1] for entry in self.builds}, {self.builds[0][1]})
         self.assertEqual([entry[2:4] for entry in self.builds], [(b'2.2.1\n', b'2.2.1\n')] * 2)
         self.assertEqual(self.pin.read_bytes(), b'2.2.1\n')
-        self.assertEqual(self.build(['build']), 0, self.errors.getvalue())
+        self.assertEqual(self.build(['build', '--only-cli']), 0, self.errors.getvalue())
         self.assertEqual(self.builds[-1][2], b'2.2.1\n')
         self.assertEqual(self.shipped.read_bytes(), b'latest\n')
 
@@ -141,17 +142,17 @@ class ClaudeVersionTests(unittest.TestCase):
         config = self.root / 'other.toml'
         config.write_text('')
         self.env['CLAUDE_CONFIG_FILE'] = str(config)
-        self.assertEqual(self.build(['build', '--desktop']), 0, self.errors.getvalue())
+        self.assertEqual(self.build(['build', '--only-desktop']), 0, self.errors.getvalue())
         self.assertEqual(self.builds[-1][0], 'claude-desktop')
         self.assertEqual(self.builds[-1][2:], (b'2.2.0\n', b' \t2.2.0\r\n', []))
 
     def test_failed_first_lookup_does_not_create_a_pin_or_build(self):
-        self.assertEqual(self.build(['build'], TimeoutError('private metadata error')), 1)
+        self.assertEqual(self.build(['build', '--only-cli'], TimeoutError('private metadata error')), 1)
         self.assertFalse(self.pin.parent.exists())
         self.assertFalse(self.builds)
 
     def test_update_publishes_private_pin_and_builds_both_products_from_one_snapshot(self):
-        self.assertEqual(self.build(['build', '--all', '--update-claude'], b'2.2.1\n', edit_after_cli=True),
+        self.assertEqual(self.build(['update'], b'2.2.1\n', edit_after_cli=True),
                          0, self.errors.getvalue())
         self.assertEqual([service for service, *_ in self.builds], ['claude-cli', 'claude-desktop'])
         paths = {context for _, context, *_ in self.builds}
@@ -163,15 +164,15 @@ class ClaudeVersionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.pin.parent.stat().st_mode), 0o700)
 
     def test_rebuild_update_persists_selection_on_docker_failure(self):
-        self.assertEqual(self.build(['rebuild', '--desktop', '--update-claude'], b'2.2.0', fail=True),
+        self.assertEqual(self.build(['update', '--only-cli', '--rebuild'], b'2.2.0', fail=True),
                          1, self.errors.getvalue())
         self.assertIn('Docker Compose failed (exit 7)', self.errors.getvalue())
         service, _, snapshot, selected, options = self.builds[-1]
-        self.assertEqual(service, 'claude-desktop')
+        self.assertEqual(service, 'claude-cli')
         self.assertEqual((snapshot, selected), (b'2.2.0\n', b'2.2.0\n'))
         self.assertCountEqual(options, ['--pull', '--no-cache'])
         self.assertEqual(self.pin.read_bytes(), selected)
-        self.assertEqual(self.build(['build']), 0, self.errors.getvalue())
+        self.assertEqual(self.build(['build', '--only-cli']), 0, self.errors.getvalue())
         self.assertEqual(self.builds[-1][2], b'2.2.0\n')
 
     def test_equal_or_older_latest_keeps_existing_pin_bytes_and_metadata(self):
@@ -180,7 +181,7 @@ class ClaudeVersionTests(unittest.TestCase):
         initial = self.pin.stat()
         for metadata in (b'2.10.0', b'2.9.99'):
             with self.subTest(metadata=metadata):
-                self.assertEqual(self.build(['build', '--update-claude'], metadata), 0, self.errors.getvalue())
+                self.assertEqual(self.build(['update', '--only-cli'], metadata), 0, self.errors.getvalue())
                 self.assertEqual(self.builds[-1][2], b'2.10.0\n')
                 current = self.pin.stat()
                 self.assertEqual((current.st_ino, current.st_mtime_ns, current.st_mode),
@@ -194,7 +195,7 @@ class ClaudeVersionTests(unittest.TestCase):
                          URLError('private-proxy-detail'), TimeoutError('private-timeout-detail'),
                          ValueError('private-invalid-proxy-url')):
             with self.subTest(response=response):
-                self.assertEqual(self.build(['build', '--update-claude'], response), 1, self.errors.getvalue())
+                self.assertEqual(self.build(['update', '--only-cli'], response), 1, self.errors.getvalue())
                 self.assertIn('Claude Code', self.errors.getvalue())
                 self.assertNotIn('private-', self.errors.getvalue())
                 self.assertEqual(self.pin.read_bytes(), b'2.2.0\n')
@@ -212,7 +213,7 @@ class ClaudeVersionTests(unittest.TestCase):
             with self.subTest(diagnostic=diagnostic):
                 self.errors.seek(0)
                 self.errors.truncate()
-                self.assertEqual(self.build(['build', '--update-claude'], error), 1)
+                self.assertEqual(self.build(['update', '--only-cli'], error), 1)
                 self.assertIn(diagnostic, self.errors.getvalue())
                 self.assertNotIn('private-', self.errors.getvalue())
                 self.assertEqual(self.pin.read_bytes(), b'2.2.0\n')
@@ -231,7 +232,7 @@ class ClaudeVersionTests(unittest.TestCase):
                 self.errors.seek(0)
                 self.errors.truncate()
                 with framed_response(headers, body) as response:
-                    self.assertEqual(self.build(['build', '--update-claude'], response),
+                    self.assertEqual(self.build(['update', '--only-cli'], response),
                                      1, self.errors.getvalue())
                 self.assertIn('incomplete HTTP response', self.errors.getvalue())
                 self.assertNotIn('2.3.4', self.errors.getvalue())
@@ -270,7 +271,7 @@ class ClaudeVersionTests(unittest.TestCase):
         before = self.pin.stat()
         with framed_response(b'Content-Length: 5\r\nContent-Range: bytes 0-4/10\r\n', b'2.3.4',
                              status=206) as response:
-            self.assertEqual(self.build(['build', '--update-claude'], response), 1, self.errors.getvalue())
+            self.assertEqual(self.build(['update', '--only-cli'], response), 1, self.errors.getvalue())
         self.assertIn('HTTP status 206', self.errors.getvalue())
         self.assertFalse(self.builds)
         after = self.pin.stat()
@@ -281,7 +282,7 @@ class ClaudeVersionTests(unittest.TestCase):
     def test_partial_http_metadata_does_not_create_first_pin_or_build(self):
         with framed_response(b'Content-Length: 5\r\nContent-Range: bytes 0-4/10\r\n', b'2.3.4',
                              status=206) as response:
-            self.assertEqual(self.build(['build'], response), 1, self.errors.getvalue())
+            self.assertEqual(self.build(['build', '--only-cli'], response), 1, self.errors.getvalue())
         self.assertIn('HTTP status 206', self.errors.getvalue())
         self.assertFalse(self.pin.parent.exists())
         self.assertFalse(self.builds)
@@ -296,7 +297,7 @@ class ClaudeVersionTests(unittest.TestCase):
     def test_metadata_redirect_to_http_is_rejected(self):
         self.write_pin(b'2.2.0\n')
         response = ReleaseResponse(b'2.3.0', 'http://untrusted.test/latest')
-        self.assertEqual(self.build(['build', '--update-claude'], response), 1, self.errors.getvalue())
+        self.assertEqual(self.build(['update', '--only-cli'], response), 1, self.errors.getvalue())
         self.assertEqual(self.pin.read_bytes(), b'2.2.0\n')
         self.assertFalse(self.builds)
 
@@ -343,7 +344,7 @@ class ClaudeVersionTests(unittest.TestCase):
             with patch.dict(os.environ, self.env, clear=True), redirect_stderr(self.errors), \
                     patch('urllib.request.HTTPSHandler.https_open', return_value=response) as https, \
                     patch.object(cli.CommandRunner, 'run', side_effect=self.run_metadata_worker):
-                self.assertEqual(cli.main(['build', '--update-claude']), 1)
+                self.assertEqual(cli.main(['update', '--only-cli']), 1)
             self.assertTrue(body.closed)
         self.assertEqual([call.args[0].full_url for call in https.call_args_list], [url])
         self.assertIn('redirect refused', self.errors.getvalue())
@@ -358,8 +359,8 @@ class ClaudeVersionTests(unittest.TestCase):
         (checkout / 'image').mkdir(parents=True)
         (checkout / 'image/claude-code.version').write_bytes(b'2.1.326\n')
         layout = InstallLayout.user(self.env)
-        install_release(ROOT, layout, version='0.4.6')
-        installed = layout.release_dir('0.4.6')
+        install_release(ROOT, layout, version='0.5.0')
+        installed = layout.release_dir('0.5.0')
         self.pin.parent.parent.mkdir(parents=True)
         for program in (checkout, installed):
             with self.subTest(program=program):
@@ -404,7 +405,7 @@ class ClaudeVersionTests(unittest.TestCase):
 
     def test_both_builds_use_the_returned_selection_if_pin_changes_after_publication(self):
         original_replace = os.replace
-        for arguments in (['build', '--all', '--update-claude'], ['build', '--all']):
+        for arguments in (['update'], ['build']):
             with self.subTest(arguments=arguments):
                 self.pin.unlink(missing_ok=True)
                 self.builds.clear()
@@ -422,7 +423,7 @@ class ClaudeVersionTests(unittest.TestCase):
 
     def test_invalid_pin_is_rejected_before_docker_or_update_lookup(self):
         self.write_pin(b'invalid-private-pin')
-        for args in (['build'], ['build', '--update-claude']):
+        for args in (['build', '--only-cli'], ['update', '--only-cli']):
             self.assertEqual(self.build(args), 1, self.errors.getvalue())
             self.assertIn(str(self.pin), self.errors.getvalue())
             self.assertNotIn('invalid-private-pin', self.errors.getvalue())
@@ -441,7 +442,7 @@ class ClaudeVersionTests(unittest.TestCase):
                     self.write_pin(b'2.2.0')
                     self.pin.chmod(0)
                 try:
-                    self.assertEqual(self.build(['build']), 1, self.errors.getvalue())
+                    self.assertEqual(self.build(['build', '--only-cli']), 1, self.errors.getvalue())
                 finally:
                     self.pin.rmdir() if kind == 'directory' else self.pin.unlink()
         self.assertFalse(self.builds)
@@ -451,9 +452,9 @@ class ClaudeVersionTests(unittest.TestCase):
         target = self.root / 'managed-pin'
         target.write_bytes(b'2.2.0\n')
         self.pin.symlink_to(target)
-        self.assertEqual(self.build(['build']), 0, self.errors.getvalue())
+        self.assertEqual(self.build(['build', '--only-cli']), 0, self.errors.getvalue())
         self.assertEqual(self.builds[-1][2], b'2.2.0\n')
-        self.assertEqual(self.build(['build', '--update-claude']), 1, self.errors.getvalue())
+        self.assertEqual(self.build(['update', '--only-cli']), 1, self.errors.getvalue())
         self.assertIn('symlink', self.errors.getvalue())
         self.assertEqual(len(self.builds), 1)
         self.assertEqual(self.pin.readlink(), target)
